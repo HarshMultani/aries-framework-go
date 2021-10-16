@@ -25,12 +25,13 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/didexchange"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/introduce"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/issuecredential"
-	jsonldcontext "github.com/hyperledger/aries-framework-go/pkg/controller/command/jsonld/context"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/kms"
+	"github.com/hyperledger/aries-framework-go/pkg/controller/command/ld"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/mediator"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/messaging"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/outofband"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/presentproof"
+	"github.com/hyperledger/aries-framework-go/pkg/controller/command/vcwallet"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/vdr"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/verifiable"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/messaging/msghandler"
@@ -132,6 +133,10 @@ func prepareFrameworkOptions(opts *config.Options) ([]aries.Option, error) {
 		}
 
 		options = append(options, rsopts...)
+	}
+
+	if opts.DocumentLoader != nil {
+		options = append(options, aries.WithJSONLDDocumentLoader(opts.DocumentLoader))
 	}
 
 	return options, nil
@@ -324,12 +329,22 @@ func (a *Aries) GetKMSController() (api.KMSController, error) {
 	return &KMS{handlers: handlers}, nil
 }
 
-// GetJSONLDContextController returns a JSONLDContext instance.
-func (a *Aries) GetJSONLDContextController() (api.JSONLDContextController, error) {
-	handlers, ok := a.handlers[jsonldcontext.CommandName]
+// GetLDController returns an LD instance.
+func (a *Aries) GetLDController() (api.LDController, error) {
+	handlers, ok := a.handlers[ld.CommandName]
 	if !ok {
-		return nil, fmt.Errorf("no handlers found for controller [%s]", jsonldcontext.CommandName)
+		return nil, fmt.Errorf("no handlers found for controller [%s]", ld.CommandName)
 	}
 
-	return &JSONLDContext{handlers: handlers}, nil
+	return &LD{handlers: handlers}, nil
+}
+
+// GetVCWalletController returns a VCWalletController instance.
+func (a *Aries) GetVCWalletController() (api.VCWalletController, error) {
+	handlers, ok := a.handlers[vcwallet.CommandName]
+	if !ok {
+		return nil, fmt.Errorf("no handlers found for controller [%s]", vcwallet.CommandName)
+	}
+
+	return &VCWallet{handlers: handlers}, nil
 }

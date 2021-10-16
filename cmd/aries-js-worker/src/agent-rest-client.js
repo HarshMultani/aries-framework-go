@@ -339,8 +339,16 @@ const pkgs = {
             path: "/presentproof/send-request-presentation",
             method: "POST",
         },
+        SendRequestPresentationV3: {
+            path: "/presentproof/v3/send-request-presentation",
+            method: "POST",
+        },
         SendProposePresentation: {
             path: "/presentproof/send-propose-presentation",
+            method: "POST",
+        },
+        SendProposePresentationV3: {
+            path: "/presentproof/v3/send-propose-presentation",
             method: "POST",
         },
         AcceptProblemReport: {
@@ -353,8 +361,18 @@ const pkgs = {
             method: "POST",
             pathParam: "piid"
         },
+        AcceptRequestPresentationV3: {
+            path: "/presentproof/v3/{piid}/accept-request-presentation",
+            method: "POST",
+            pathParam: "piid"
+        },
         AcceptProposePresentation: {
             path: "/presentproof/{piid}/accept-propose-presentation",
+            method: "POST",
+            pathParam: "piid"
+        },
+        AcceptProposePresentationV3: {
+            path: "/presentproof/v3/{piid}/accept-propose-presentation",
             method: "POST",
             pathParam: "piid"
         },
@@ -365,6 +383,11 @@ const pkgs = {
         },
         NegotiateRequestPresentation: {
             path: "/presentproof/{piid}/negotiate-request-presentation",
+            method: "POST",
+            pathParam: "piid"
+        },
+        NegotiateRequestPresentationV3: {
+            path: "/presentproof/v3/{piid}/negotiate-request-presentation",
             method: "POST",
             pathParam: "piid"
         },
@@ -402,6 +425,11 @@ const pkgs = {
         UpdateProfile: {
             path: "/vcwallet/update-profile",
             method: "POST",
+        },
+        ProfileExists: {
+            path: "/vcwallet/profile/{id}",
+            method: "GET",
+            pathParam: "id",
         },
         Open: {
             path: "/vcwallet/open",
@@ -451,10 +479,44 @@ const pkgs = {
             path: "/vcwallet/create-key-pair",
             method: "POST",
         },
+        Connect: {
+            path: "/vcwallet/connect",
+            method: "POST",
+        },
+        ProposePresentation: {
+            path: "/vcwallet/propose-presentation",
+            method: "POST",
+        },
+        PresentProof: {
+            path: "/vcwallet/present-proof",
+            method: "POST",
+        },
     },
-    context: {
-        Add: {
-            path: "/context/add",
+    ld: {
+        AddContexts: {
+            path: "/ld/context",
+            method: "POST",
+        },
+        AddRemoteProvider: {
+            path: "/ld/remote-provider",
+            method: "POST"
+        },
+        RefreshRemoteProvider: {
+            path: "/ld/remote-provider/{id}/refresh",
+            method: "POST",
+            pathParam: "id"
+        },
+        DeleteRemoteProvider: {
+            path: "/ld/remote-provider/{id}",
+            method: "DELETE",
+            pathParam: "id"
+        },
+        GetAllRemoteProviders: {
+            path: "/ld/remote-providers",
+            method: "GET",
+        },
+        RefreshAllRemoteProviders: {
+            path: "/ld/remote-providers/refresh",
             method: "POST",
         },
     },

@@ -7,7 +7,6 @@ SPDX-License-Identifier: Apache-2.0
 import {environment} from "../environment.js";
 import {newDIDExchangeClient, newDIDExchangeRESTClient} from "../didexchange/didexchange_e2e.js";
 import {watchForEvent} from "../common.js";
-import {addJSONLDContexts} from "../contexts.js";
 
 const agent1ControllerApiUrl = `${environment.HTTP_SCHEME}://${environment.SECOND_USER_HOST}:${environment.SECOND_USER_API_PORT}`
 const agent2ControllerApiUrl = `${environment.HTTP_SCHEME}://${environment.USER_HOST}:${environment.USER_API_PORT}`
@@ -73,9 +72,6 @@ async function issueCredential (mode) {
 
         holder = didexClient.agent1
         issuer = didexClient.agent2
-
-        await addJSONLDContexts(holder)
-        await addJSONLDContexts(issuer)
     })
 
     after(async () => {
@@ -106,7 +102,9 @@ async function issueCredential (mode) {
 
     const credentialName = "license"
 
+    let credential;
     it("Holder accepts credential", async function () {
+        credential = getCredential(holder, credentialName)
         return holder.issuecredential.acceptCredential({
             piid: (await holderAction).Properties.piid,
             names: [credentialName],
@@ -114,11 +112,11 @@ async function issueCredential (mode) {
     })
 
     it("Checks credential", async function () {
-        let credential = await getCredential(holder, credentialName)
+        let cred = await credential;
         let credentials = await holder.verifiable.getCredentials()
 
         const check = (cred) =>{
-            if (cred.id !== credential.id){
+            if (cred.id !== cred.id){
                 return false
             }
 

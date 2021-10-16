@@ -7,14 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 package key
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/hyperledger/aries-framework-go/pkg/doc/did"
 	vdrapi "github.com/hyperledger/aries-framework-go/pkg/framework/aries/api/vdr"
 	"github.com/hyperledger/aries-framework-go/pkg/internal/cryptoutil"
-	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/vdr/fingerprint"
 )
 
@@ -43,19 +41,27 @@ func (v *VDR) Create(didDoc *did.Doc, opts ...vdrapi.DIDMethodOption) (*did.DocR
 		didKey            string
 		keyID             string
 		keyCode           uint64
-		keyType           kms.KeyType
 	)
 
 	if len(didDoc.VerificationMethod) == 0 {
 		return nil, fmt.Errorf("verification method is empty")
 	}
 
-	keyCode, err = getKeyCode(keyType, &didDoc.VerificationMethod[0])
-	if err != nil {
-		return nil, err
+	switch didDoc.VerificationMethod[0].Type {
+	case jsonWebKey2020:
+		didKey, keyID, err = fingerprint.CreateDIDKeyByJwk(didDoc.VerificationMethod[0].JSONWebKey())
+		if err != nil {
+			return nil, err
+		}
+	default:
+		keyCode, err = getKeyCode(&didDoc.VerificationMethod[0])
+		if err != nil {
+			return nil, err
+		}
+
+		didKey, keyID = fingerprint.CreateDIDKeyByCode(keyCode, didDoc.VerificationMethod[0].Value)
 	}
 
-	didKey, keyID = fingerprint.CreateDIDKeyByCode(keyCode, didDoc.VerificationMethod[0].Value)
 	publicKey = did.NewVerificationMethodFromBytes(keyID, didDoc.VerificationMethod[0].Type, didKey,
 		didDoc.VerificationMethod[0].Value)
 
@@ -80,7 +86,7 @@ func (v *VDR) Create(didDoc *did.Doc, opts ...vdrapi.DIDMethodOption) (*did.DocR
 	return &did.DocResolution{Context: []string{schemaResV1}, DIDDocument: createDoc(publicKey, keyAgr, didKey)}, nil
 }
 
-func getKeyCode(keyType kms.KeyType, verificationMethod *did.VerificationMethod) (uint64, error) {
+func getKeyCode(verificationMethod *did.VerificationMethod) (uint64, error) {
 	var keyCode uint64
 
 	switch verificationMethod.Type {
@@ -88,36 +94,11 @@ func getKeyCode(keyType kms.KeyType, verificationMethod *did.VerificationMethod)
 		keyCode = fingerprint.ED25519PubKeyMultiCodec
 	case bls12381G2Key2020:
 		keyCode = fingerprint.BLS12381g2PubKeyMultiCodec
-	case jsonWebKey2020:
-		if keyType == "" {
-			return fetchECKeyCodeFromVerMethod(verificationMethod)
-		}
-
-		switch keyType {
-		case kms.ECDSAP256TypeDER, kms.ECDSAP256TypeIEEEP1363:
-			keyCode = fingerprint.P256PubKeyMultiCodec
-		case kms.ECDSAP384TypeDER, kms.ECDSAP384TypeIEEEP1363:
-			keyCode = fingerprint.P384PubKeyMultiCodec
-		case kms.ECDSAP521TypeDER, kms.ECDSAP521TypeIEEEP1363:
-			keyCode = fingerprint.P521PubKeyMultiCodec
-		default:
-			return 0, errors.New("invalid jsonWebKey2020 key type")
-		}
 	default:
 		return 0, fmt.Errorf("not supported public key type: %s", verificationMethod.Type)
 	}
 
 	return keyCode, nil
-}
-
-func fetchECKeyCodeFromVerMethod(method *did.VerificationMethod) (uint64, error) {
-	ecdsaCodesByKeyLen := map[int]uint64{
-		64:  fingerprint.P256PubKeyMultiCodec,
-		96:  fingerprint.P384PubKeyMultiCodec,
-		132: fingerprint.P521PubKeyMultiCodec,
-	}
-
-	return ecdsaCodesByKeyLen[len(method.Value)], nil
 }
 
 func createDoc(pubKey, keyAgreement *did.VerificationMethod, didKey string) *did.Doc {

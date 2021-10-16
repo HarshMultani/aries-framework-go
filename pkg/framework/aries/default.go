@@ -40,7 +40,7 @@ import (
 )
 
 // defFrameworkOpts provides default framework options.
-func defFrameworkOpts(frameworkOpts *Aries) error {
+func defFrameworkOpts(frameworkOpts *Aries) error { //nolint:gocyclo
 	// TODO https://github.com/hyperledger/aries-framework-go/issues/209 Move default providers to the sub-package
 	if len(frameworkOpts.outboundTransports) == 0 {
 		outbound, err := arieshttp.NewOutbound(arieshttp.WithOutboundHTTPClient(&http.Client{}))
@@ -55,7 +55,17 @@ func defFrameworkOpts(frameworkOpts *Aries) error {
 		frameworkOpts.storeProvider = storeProvider()
 	}
 
-	err := createJSONLDDocumentLoader(frameworkOpts)
+	err := createJSONLDContextStore(frameworkOpts)
+	if err != nil {
+		return err
+	}
+
+	err = createJSONLDRemoteProviderStore(frameworkOpts)
+	if err != nil {
+		return err
+	}
+
+	err = createJSONLDDocumentLoader(frameworkOpts)
 	if err != nil {
 		return err
 	}
@@ -196,7 +206,7 @@ func setAdditionalDefaultOpts(frameworkOpts *Aries) error {
 				return legacy.New(provider), nil
 			},
 			func(provider packer.Provider) (packer.Packer, error) {
-				return authcrypt.New(provider, jose.A256GCM)
+				return authcrypt.New(provider, jose.A256CBCHS512)
 			},
 			func(provider packer.Provider) (packer.Packer, error) {
 				return anoncrypt.New(provider, jose.A256GCM)
@@ -218,6 +228,14 @@ func setAdditionalDefaultOpts(frameworkOpts *Aries) error {
 		frameworkOpts.msgSvcProvider = &noOpMessageServiceProvider{}
 	}
 
+	if frameworkOpts.mediaTypeProfiles == nil {
+		// For now only set legacy media type profile to match default key type and primary packer above.
+		// Using media type profile, not just a media type, in order to align with OOB invitations' Accept header.
+		// TODO once keyAgreement is added in the packers, this can be switched to DIDcomm V2 media type as well as
+		// 		switching legacyPacker with authcrtypt as primary packer and using an ECDH-1PU key as default key above.
+		frameworkOpts.mediaTypeProfiles = []string{transport.MediaTypeAIP2RFC0019Profile}
+	}
+
 	return nil
 }
 
@@ -228,7 +246,7 @@ func assignVerifiableStoreIfNeeded(aries *Aries, storeProvider storage.Provider)
 
 	provider, err := context.New(
 		context.WithStorageProvider(storeProvider),
-		context.WithJSONLDDocumentLoader(aries.jsonldDocumentLoader),
+		context.WithJSONLDDocumentLoader(aries.documentLoader),
 	)
 	if err != nil {
 		return fmt.Errorf("verifiable store initialization failed : %w", err)

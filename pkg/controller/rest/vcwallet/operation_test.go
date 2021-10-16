@@ -18,18 +18,30 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/require"
 
+	outofbandClient "github.com/hyperledger/aries-framework-go/pkg/client/outofband"
 	"github.com/hyperledger/aries-framework-go/pkg/controller/command/vcwallet"
 	"github.com/hyperledger/aries-framework-go/pkg/crypto/tinkcrypto"
+	"github.com/hyperledger/aries-framework-go/pkg/didcomm/common/service"
+	"github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/didexchange"
+	"github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/mediator"
+	outofbandSvc "github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/outofband"
+	presentproofSvc "github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/presentproof"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/did"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/verifiable"
 	vdrapi "github.com/hyperledger/aries-framework-go/pkg/framework/aries/api/vdr"
-	"github.com/hyperledger/aries-framework-go/pkg/internal/jsonldtest"
+	"github.com/hyperledger/aries-framework-go/pkg/internal/ldtestutil"
 	"github.com/hyperledger/aries-framework-go/pkg/kms"
+	mockdidexchange "github.com/hyperledger/aries-framework-go/pkg/mock/didcomm/protocol/didexchange"
+	mockmediator "github.com/hyperledger/aries-framework-go/pkg/mock/didcomm/protocol/mediator"
+	mockoutofband "github.com/hyperledger/aries-framework-go/pkg/mock/didcomm/protocol/outofband"
+	mockpresentproof "github.com/hyperledger/aries-framework-go/pkg/mock/didcomm/protocol/presentproof"
 	mockprovider "github.com/hyperledger/aries-framework-go/pkg/mock/provider"
 	mockstorage "github.com/hyperledger/aries-framework-go/pkg/mock/storage"
 	mockvdr "github.com/hyperledger/aries-framework-go/pkg/mock/vdr"
+	"github.com/hyperledger/aries-framework-go/pkg/store/connection"
 	"github.com/hyperledger/aries-framework-go/pkg/vdr/key"
 	"github.com/hyperledger/aries-framework-go/pkg/wallet"
 )
@@ -239,7 +251,7 @@ func TestNew(t *testing.T) {
 		cmd := New(newMockProvider(t), &vcwallet.Config{})
 		require.NotNil(t, cmd)
 
-		require.Len(t, cmd.GetRESTHandlers(), 14)
+		require.Len(t, cmd.GetRESTHandlers(), 18)
 	})
 }
 
@@ -468,6 +480,60 @@ func TestOperation_UpdateProfile(t *testing.T) {
 		rw := httptest.NewRecorder()
 		cmd.UpdateProfile(rw, rq)
 		require.Equal(t, rw.Code, http.StatusBadRequest)
+	})
+}
+
+func TestCommand_ProfileExists(t *testing.T) {
+	const (
+		sampleUser1 = "sample-user-01"
+		sampleUser2 = "sample-user-02"
+	)
+
+	mockctx := newMockProvider(t)
+
+	createSampleUserProfile(t, mockctx, &vcwallet.CreateOrUpdateProfileRequest{
+		UserID:             sampleUser1,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	t.Run("profile exists", func(t *testing.T) {
+		cmd := New(mockctx, &vcwallet.Config{})
+		require.NotNil(t, cmd)
+
+		rw := httptest.NewRecorder()
+		rq := mux.SetURLVars(httptest.NewRequest(http.MethodGet, ProfileExistsPath, nil), map[string]string{
+			"id": sampleUser1,
+		})
+
+		cmd.ProfileExists(rw, rq)
+		require.Equal(t, rw.Code, http.StatusOK)
+		require.Empty(t, rw.Body.String())
+	})
+
+	t.Run("profile doesn't exists", func(t *testing.T) {
+		cmd := New(mockctx, &vcwallet.Config{})
+		require.NotNil(t, cmd)
+
+		rw := httptest.NewRecorder()
+		rq := mux.SetURLVars(httptest.NewRequest(http.MethodGet, ProfileExistsPath, nil), map[string]string{
+			"id": sampleUser2,
+		})
+
+		cmd.ProfileExists(rw, rq)
+		require.Equal(t, rw.Code, http.StatusInternalServerError)
+		require.Contains(t, rw.Body.String(), wallet.ErrProfileNotFound.Error())
+	})
+
+	t.Run("invalid request", func(t *testing.T) {
+		cmd := New(mockctx, &vcwallet.Config{})
+		require.NotNil(t, cmd)
+
+		rw := httptest.NewRecorder()
+		rq := httptest.NewRequest(http.MethodGet, ProfileExistsPath, nil)
+
+		cmd.ProfileExists(rw, rq)
+		require.Equal(t, rw.Code, http.StatusBadRequest)
+		require.Contains(t, rw.Body.String(), "empty profile ID")
 	})
 }
 
@@ -1321,6 +1387,272 @@ func TestOperation_CreateKeyPair(t *testing.T) {
 	})
 }
 
+func TestOperation_Connect(t *testing.T) {
+	const sampleDIDCommUser = "sample-didcomm-user-01"
+
+	mockctx := newMockProvider(t)
+
+	createSampleUserProfile(t, mockctx, &vcwallet.CreateOrUpdateProfileRequest{
+		UserID:             sampleDIDCommUser,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	token, lock := unlockWallet(t, mockctx, &vcwallet.UnlockWalletRequest{
+		UserID:             sampleDIDCommUser,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	defer lock()
+
+	t.Run("wallet connect operation success", func(t *testing.T) {
+		sampleConnID := uuid.New().String()
+
+		oobSvc := &mockoutofband.MockOobService{
+			AcceptInvitationHandle: func(*outofbandSvc.Invitation, outofbandSvc.Options) (string, error) {
+				return sampleConnID, nil
+			},
+		}
+		mockctx.ServiceMap[outofbandSvc.Name] = oobSvc
+
+		didexSvc := &mockdidexchange.MockDIDExchangeSvc{
+			RegisterMsgEventHandle: func(ch chan<- service.StateMsg) error {
+				ch <- service.StateMsg{
+					Type:       service.PostState,
+					StateID:    didexchange.StateIDCompleted,
+					Properties: &mockdidexchange.MockEventProperties{ConnID: sampleConnID},
+				}
+
+				return nil
+			},
+		}
+		mockctx.ServiceMap[didexchange.DIDExchange] = didexSvc
+
+		request := &vcwallet.ConnectRequest{
+			WalletAuth: vcwallet.WalletAuth{UserID: sampleDIDCommUser, Auth: token},
+			Invitation: &outofbandClient.Invitation{},
+			ConnectOpts: vcwallet.ConnectOpts{
+				MyLabel: "sample-label",
+			},
+		}
+
+		rq := httptest.NewRequest(http.MethodPost, ConnectPath, getReader(t, request))
+		rw := httptest.NewRecorder()
+
+		cmd := New(mockctx, &vcwallet.Config{})
+		cmd.Connect(rw, rq)
+		require.Equal(t, rw.Code, http.StatusOK)
+
+		var r connectResponse
+		require.NoError(t, json.NewDecoder(rw.Body).Decode(&r.Response))
+		require.NotEmpty(t, r)
+		require.NotEmpty(t, r.Response)
+		require.Equal(t, sampleConnID, r.Response.ConnectionID)
+	})
+
+	t.Run("wallet connect operation failure", func(t *testing.T) {
+		didexSvc := &mockdidexchange.MockDIDExchangeSvc{
+			RegisterMsgEventHandle: func(ch chan<- service.StateMsg) error {
+				return fmt.Errorf(sampleCommandError)
+			},
+		}
+		mockctx.ServiceMap[didexchange.DIDExchange] = didexSvc
+
+		request := &vcwallet.ConnectRequest{
+			WalletAuth: vcwallet.WalletAuth{UserID: sampleDIDCommUser, Auth: token},
+			Invitation: &outofbandClient.Invitation{},
+			ConnectOpts: vcwallet.ConnectOpts{
+				MyLabel: "sample-label",
+			},
+		}
+
+		rq := httptest.NewRequest(http.MethodPost, ConnectPath, getReader(t, request))
+		rw := httptest.NewRecorder()
+
+		cmd := New(mockctx, &vcwallet.Config{})
+		cmd.Connect(rw, rq)
+		require.Equal(t, rw.Code, http.StatusInternalServerError)
+		require.Contains(t, rw.Body.String(), sampleCommandError)
+	})
+}
+
+func TestOperation_ProposePresentation(t *testing.T) {
+	const sampleDIDCommUser = "sample-didcomm-user-02"
+
+	mockctx := newMockProvider(t)
+
+	createSampleUserProfile(t, mockctx, &vcwallet.CreateOrUpdateProfileRequest{
+		UserID:             sampleDIDCommUser,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	token, lock := unlockWallet(t, mockctx, &vcwallet.UnlockWalletRequest{
+		UserID:             sampleDIDCommUser,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	defer lock()
+
+	const (
+		myDID    = "did:mydid:123"
+		theirDID = "did:theirdid:123"
+	)
+
+	t.Run("wallet propose presentation success", func(t *testing.T) {
+		sampleConnID := uuid.New().String()
+		oobSvc := &mockoutofband.MockOobService{
+			AcceptInvitationHandle: func(*outofbandSvc.Invitation, outofbandSvc.Options) (string, error) {
+				return sampleConnID, nil
+			},
+		}
+		mockctx.ServiceMap[outofbandSvc.Name] = oobSvc
+
+		didexSvc := &mockdidexchange.MockDIDExchangeSvc{
+			RegisterMsgEventHandle: func(ch chan<- service.StateMsg) error {
+				ch <- service.StateMsg{
+					Type:       service.PostState,
+					StateID:    didexchange.StateIDCompleted,
+					Properties: &mockdidexchange.MockEventProperties{ConnID: sampleConnID},
+				}
+
+				return nil
+			},
+		}
+		mockctx.ServiceMap[didexchange.DIDExchange] = didexSvc
+
+		thID := uuid.New().String()
+		ppSvc := &mockpresentproof.MockPresentProofSvc{
+			ActionsFunc: func() ([]presentproofSvc.Action, error) {
+				return []presentproofSvc.Action{
+					{
+						PIID: thID,
+						Msg: service.NewDIDCommMsgMap(&presentproofSvc.RequestPresentation{
+							Comment: "mock msg",
+						}),
+						MyDID:    myDID,
+						TheirDID: theirDID,
+					},
+				}, nil
+			},
+			HandleFunc: func(service.DIDCommMsg) (string, error) {
+				return thID, nil
+			},
+		}
+
+		mockctx.ServiceMap[outofbandSvc.Name] = oobSvc
+		mockctx.ServiceMap[presentproofSvc.Name] = ppSvc
+
+		store, err := mockctx.StorageProvider().OpenStore(connection.Namespace)
+		require.NoError(t, err)
+
+		record := &connection.Record{
+			ConnectionID: sampleConnID,
+			MyDID:        myDID,
+			TheirDID:     theirDID,
+		}
+		recordBytes, err := json.Marshal(record)
+		require.NoError(t, err)
+		require.NoError(t, store.Put(fmt.Sprintf("conn_%s", sampleConnID), recordBytes))
+
+		request := &vcwallet.ProposePresentationRequest{
+			WalletAuth: vcwallet.WalletAuth{UserID: sampleDIDCommUser, Auth: token},
+			Invitation: &outofbandClient.Invitation{},
+		}
+
+		rq := httptest.NewRequest(http.MethodPost, ConnectPath, getReader(t, request))
+		rw := httptest.NewRecorder()
+
+		cmd := New(mockctx, &vcwallet.Config{})
+		cmd.ProposePresentation(rw, rq)
+		require.Equal(t, rw.Code, http.StatusOK)
+
+		var r proposePresentationResponse
+		require.NoError(t, json.NewDecoder(rw.Body).Decode(&r.Response))
+		require.NotEmpty(t, r)
+		require.NotEmpty(t, r.Response)
+		require.NotEmpty(t, r.Response.PresentationRequest)
+	})
+
+	t.Run("wallet propose presentation failure", func(t *testing.T) {
+		oobSvc := &mockoutofband.MockOobService{
+			AcceptInvitationHandle: func(*outofbandSvc.Invitation, outofbandSvc.Options) (string, error) {
+				return "", fmt.Errorf(sampleCommandError)
+			},
+		}
+
+		mockctx.ServiceMap[outofbandSvc.Name] = oobSvc
+
+		request := &vcwallet.ProposePresentationRequest{
+			WalletAuth: vcwallet.WalletAuth{UserID: sampleDIDCommUser, Auth: token},
+			Invitation: &outofbandClient.Invitation{},
+		}
+
+		rq := httptest.NewRequest(http.MethodPost, ProposePresentationPath, getReader(t, request))
+		rw := httptest.NewRecorder()
+
+		cmd := New(mockctx, &vcwallet.Config{})
+		cmd.ProposePresentation(rw, rq)
+		require.Equal(t, rw.Code, http.StatusInternalServerError)
+		require.Contains(t, rw.Body.String(), sampleCommandError)
+	})
+}
+
+func TestOperation_PresentProof(t *testing.T) {
+	const sampleDIDCommUser = "sample-didcomm-user-03"
+
+	mockctx := newMockProvider(t)
+
+	createSampleUserProfile(t, mockctx, &vcwallet.CreateOrUpdateProfileRequest{
+		UserID:             sampleDIDCommUser,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	token, lock := unlockWallet(t, mockctx, &vcwallet.UnlockWalletRequest{
+		UserID:             sampleDIDCommUser,
+		LocalKMSPassphrase: samplePassPhrase,
+	})
+
+	defer lock()
+
+	t.Run("wallet present proof success", func(t *testing.T) {
+		request := &vcwallet.PresentProofRequest{
+			WalletAuth:   vcwallet.WalletAuth{UserID: sampleDIDCommUser, Auth: token},
+			ThreadID:     uuid.New().String(),
+			Presentation: json.RawMessage{},
+		}
+
+		rq := httptest.NewRequest(http.MethodPost, PresentProofPath, getReader(t, request))
+		rw := httptest.NewRecorder()
+
+		cmd := New(mockctx, &vcwallet.Config{})
+		cmd.PresentProof(rw, rq)
+		require.Equal(t, rw.Code, http.StatusOK)
+	})
+
+	t.Run("wallet present proof failure", func(t *testing.T) {
+		ppSvc := &mockpresentproof.MockPresentProofSvc{
+			ActionContinueFunc: func(string, presentproofSvc.Opt) error {
+				return fmt.Errorf(sampleCommandError)
+			},
+		}
+
+		mockctx.ServiceMap[presentproofSvc.Name] = ppSvc
+
+		request := &vcwallet.PresentProofRequest{
+			WalletAuth:   vcwallet.WalletAuth{UserID: sampleDIDCommUser, Auth: token},
+			ThreadID:     uuid.New().String(),
+			Presentation: json.RawMessage{},
+		}
+
+		rq := httptest.NewRequest(http.MethodPost, PresentProofPath, getReader(t, request))
+		rw := httptest.NewRecorder()
+
+		cmd := New(mockctx, &vcwallet.Config{})
+		cmd.PresentProof(rw, rq)
+		require.Equal(t, rw.Code, http.StatusInternalServerError)
+		require.Contains(t, rw.Body.String(), sampleCommandError)
+	})
+}
+
 func createSampleUserProfile(t *testing.T, ctx *mockprovider.Provider, request *vcwallet.CreateOrUpdateProfileRequest) {
 	cmd := New(ctx, &vcwallet.Config{})
 	require.NotNil(t, cmd)
@@ -1374,12 +1706,21 @@ func addContent(t *testing.T, ctx *mockprovider.Provider, request *vcwallet.AddC
 func newMockProvider(t *testing.T) *mockprovider.Provider {
 	t.Helper()
 
-	loader, err := jsonldtest.DocumentLoader()
+	loader, err := ldtestutil.DocumentLoader()
 	require.NoError(t, err)
 
+	serviceMap := map[string]interface{}{
+		presentproofSvc.Name:    &mockpresentproof.MockPresentProofSvc{},
+		outofbandSvc.Name:       &mockoutofband.MockOobService{},
+		didexchange.DIDExchange: &mockdidexchange.MockDIDExchangeSvc{},
+		mediator.Coordination:   &mockmediator.MockMediatorSvc{},
+	}
+
 	return &mockprovider.Provider{
-		StorageProviderValue:      mockstorage.NewMockStoreProvider(),
-		JSONLDDocumentLoaderValue: loader,
+		StorageProviderValue:              mockstorage.NewMockStoreProvider(),
+		ProtocolStateStorageProviderValue: mockstorage.NewMockStoreProvider(),
+		DocumentLoaderValue:               loader,
+		ServiceMap:                        serviceMap,
 	}
 }
 
@@ -1409,7 +1750,7 @@ func parseCredential(t *testing.T, b *bytes.Buffer) *verifiable.Credential {
 
 	require.NoError(t, json.NewDecoder(b).Decode(&response))
 
-	loader, err := jsonldtest.DocumentLoader()
+	loader, err := ldtestutil.DocumentLoader()
 	require.NoError(t, err)
 
 	vc, err := verifiable.ParseCredential(response.Credential, verifiable.WithDisabledProofCheck(),
@@ -1426,7 +1767,7 @@ func parsePresentation(t *testing.T, b *bytes.Buffer) *verifiable.Presentation {
 
 	require.NoError(t, json.NewDecoder(b).Decode(&response))
 
-	loader, err := jsonldtest.DocumentLoader()
+	loader, err := ldtestutil.DocumentLoader()
 	require.NoError(t, err)
 
 	vp, err := verifiable.ParsePresentation(response.Presentation, verifiable.WithPresDisabledProofCheck(),

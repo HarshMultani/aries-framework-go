@@ -8,7 +8,10 @@ package vcwallet
 
 import (
 	"encoding/json"
+	"time"
 
+	"github.com/hyperledger/aries-framework-go/pkg/client/outofband"
+	"github.com/hyperledger/aries-framework-go/pkg/didcomm/common/service"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/verifiable"
 	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/wallet"
@@ -66,18 +69,28 @@ type UnlockWalletRequest struct {
 	// Options for authorizing access to wallet's EDV content store.
 	// Optional, to be used only if profile for this wallet user is setup to use EDV as content store.
 	EDVUnlock *UnlockAuth `json:"edvUnlocks"`
+
+	// Time duration in milliseconds after which wallet will expire its unlock status.
+	Expiry time.Duration `json:"expiry,omitempty"`
 }
 
 // UnlockAuth contains different options for authorizing access to wallet's EDV content store & webkms.
 type UnlockAuth struct {
 	// Http header 'authorization' bearer token to be used.
-	// Optional, only if required by wallet user.
+	// Optional, only if required by wallet user (for webkms or edv).
 	AuthToken string `json:"authToken,omitempty"`
 
 	// Capability if ZCAP sign header feature to be used for authorizing access.
 	// Optional, can be used only if ZCAP sign header feature is configured with command controller.
-	// Note: will not be considered When provided with `AuthToken` option.
 	Capability string `json:"capability,omitempty"`
+
+	// AuthZKeyStoreURL if ZCAP sign header feature to be used for authorizing access.
+	// Optional, can be used only if ZCAP sign header feature is configured with command controller.
+	AuthZKeyStoreURL string `json:"authzKeyStoreURL,omitempty"`
+
+	// SecretShare if ZCAP sign header feature to be used for authorizing access.
+	// Optional, can be used only if ZCAP sign header feature is configured with command controller.
+	SecretShare string `json:"secretShare,omitempty"`
 }
 
 // UnlockWalletResponse contains response for wallet unlock operation.
@@ -107,6 +120,12 @@ type WalletAuth struct {
 
 	// ID of wallet user.
 	UserID string `json:"userID"`
+}
+
+// WalletUser contains wallet user info for performing profile operations.
+type WalletUser struct {
+	// ID of wallet user.
+	ID string `json:"userID"`
 }
 
 // AddContentRequest is request for adding a content to wallet.
@@ -288,4 +307,73 @@ type CreateKeyPairRequest struct {
 // CreateKeyPairResponse is response model for creating key pair from wallet.
 type CreateKeyPairResponse struct {
 	*wallet.KeyPair
+}
+
+// ConnectRequest is request model for wallet DID connect operation.
+type ConnectRequest struct {
+	WalletAuth
+
+	// out-of-band invitation to establish connection.
+	Invitation *outofband.Invitation `json:"invitation"`
+
+	ConnectOpts
+}
+
+// ConnectOpts is option for accepting out-of-band invitation and to perform DID exchange.
+type ConnectOpts struct {
+	// Label to be shared with the other agent during the subsequent DID exchange.
+	MyLabel string `json:"myLabel,omitempty"`
+
+	// router connections to be used to establish connection.
+	RouterConnections []string `json:"routerConnections,omitempty"`
+
+	// DID to be used when reusing a connection.
+	ReuseConnection string `json:"reuseConnection,omitempty"`
+
+	// To use any recognized DID in the services array for a reusable connection.
+	ReuseAnyConnection bool `json:"reuseAnyConnection,omitempty"`
+
+	// Timeout (in milliseconds) waiting for connection status to be completed.
+	Timeout time.Duration `json:"timeout,omitempty"`
+}
+
+// ConnectResponse is response model from wallet DID connection operation.
+type ConnectResponse struct {
+	// connection ID of the connection established.
+	ConnectionID string `json:"connectionID"`
+}
+
+// ProposePresentationRequest is request model for performing propose presentation operation from wallet.
+type ProposePresentationRequest struct {
+	WalletAuth
+
+	// out-of-band invitation to establish connection and send propose presentation message.
+	Invitation *outofband.Invitation `json:"invitation"`
+
+	// Optional From DID option to customize sender DID.
+	FromDID string `json:"from,omitempty"`
+
+	// Timeout (in milliseconds) waiting for operation to be completed.
+	Timeout time.Duration `json:"timeout,omitempty"`
+
+	// Options for accepting out-of-band invitation and to perform DID exchange (for DIDComm V1).
+	ConnectionOpts ConnectOpts `json:"connectOptions,omitempty"`
+}
+
+// ProposePresentationResponse is response model from wallet propose presentation operation.
+type ProposePresentationResponse struct {
+	// response request presentation message from  relying party.
+	PresentationRequest *service.DIDCommMsgMap `json:"presentationRequest,omitempty"`
+}
+
+// PresentProofRequest is request model from wallet present proof operation.
+// Supported attachment MIME type "application/ld+json".
+type PresentProofRequest struct {
+	WalletAuth
+
+	// Thread ID from request presentation response
+	ThreadID string `json:"threadID,omitempty"`
+
+	// presentation to be sent as part of present proof message.
+	Presentation json.RawMessage `json:"presentation,omitempty"`
 }

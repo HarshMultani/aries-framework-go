@@ -4,9 +4,12 @@ SPDX-License-Identifier: Apache-2.0
 */
 
 // Package storage contains common tests for storage provider implementations.
+// These tests are intended to demonstrate the expected behaviour as defined in the documentation above the
+// spi.Provider, spi.Store and spi.Iterator interface declarations.
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -20,13 +23,32 @@ import (
 type TestOption func(opts *testOptions)
 
 type testOptions struct {
-	checkIteratorTotalItemCounts bool
+	skipTotalItemTests                            bool
+	onlySkipTotalItemTestsThatDoNotSetStoreConfig bool
+	skipSortTests                                 bool
+	onlySkipSortTestsThatDoNotSetStoreConfig      bool
 }
 
-// WithIteratorTotalItemCountTests makes iterator tests check total item counts.
-func WithIteratorTotalItemCountTests() TestOption {
+// SkipIteratorTotalItemTests causes all checks of an iterator's TotalItems method to be skipped.
+// If onlySkipTestsThatDoNotSetStoreConfig is set to true, then instead of skipping all TotalItems tests,
+// only those that don't set a store configuration will be skipped. This option is designed to allow storage
+// implementations that don't have the TotalItems method implemented (or can only run it when a store config is set) to
+// disable specific tests while still running as many tests as possible from this test suite.
+func SkipIteratorTotalItemTests(onlySkipTestsThatDoNotSetStoreConfig bool) TestOption {
 	return func(opts *testOptions) {
-		opts.checkIteratorTotalItemCounts = true
+		opts.skipTotalItemTests = true
+		opts.onlySkipTotalItemTestsThatDoNotSetStoreConfig = onlySkipTestsThatDoNotSetStoreConfig
+	}
+}
+
+// SkipSortTests skips all tests that do queries with sort options. If onlySkipTestsThatDoNotSetStoreConfig is set to
+// true, then instead of skipping all sort tests, only those that don't set a store configuration will be skipped. This
+// option is designed to allow storage implementations that don't support query sort options (or can only sort when a
+// store config is set) to disable specific tests while still running as many tests as possible from this test suite.
+func SkipSortTests(onlySkipTestsThatDoNotSetStoreConfig bool) TestOption {
+	return func(opts *testOptions) {
+		opts.skipSortTests = true
+		opts.onlySkipSortTestsThatDoNotSetStoreConfig = onlySkipTestsThatDoNotSetStoreConfig
 	}
 }
 
@@ -44,9 +66,10 @@ func getOptions(opts []TestOption) testOptions {
 
 // TestAll tests common storage functionality.
 // These tests demonstrate behaviour that is expected to be consistent across store implementations.
-// The spi.Iterator interface has a TotalItems method, but some implementations may not have it implemented yet.
-// For those that do, pass in WithIteratorTotalItemCountTests to enable those tests.
+// Some tests can be skipped by passing in the appropriate TestOptions here.
 func TestAll(t *testing.T, provider spi.Provider, opts ...TestOption) {
+	options := getOptions(opts)
+
 	// Run this first so the store count is predictable.
 	t.Run("Provider: GetOpenStores", func(t *testing.T) {
 		TestProviderGetOpenStores(t, provider)
@@ -69,7 +92,9 @@ func TestAll(t *testing.T, provider spi.Provider, opts ...TestOption) {
 		})
 		t.Run("Query", func(t *testing.T) {
 			TestStoreQuery(t, provider, opts...)
-			TestStoreQueryWithSortingAndInitialPageOptions(t, provider, opts...)
+			if !options.skipSortTests {
+				TestStoreQueryWithSortingAndInitialPageOptions(t, provider, opts...)
+			}
 		})
 		t.Run("Batch", func(t *testing.T) {
 			TestStoreBatch(t, provider)
@@ -96,6 +121,10 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		config := spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}}
 
 		err = provider.SetStoreConfig(testStoreName, config)
@@ -113,6 +142,10 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 		store, err := provider.OpenStore(storeName)
 		require.NoError(t, err)
 		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
 
 		// Set initial tags.
 		err = provider.SetStoreConfig(storeName, spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2"}})
@@ -145,6 +178,10 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		// Set initial tags.
 		err = provider.SetStoreConfig(storeName, spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2"}})
 		require.NoError(t, err)
@@ -164,6 +201,10 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 		store, err := provider.OpenStore(storeName)
 		require.NoError(t, err)
 		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
 
 		// Set initial tags.
 		err = provider.SetStoreConfig(storeName,
@@ -193,6 +234,10 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		// Tag names cannot contain any ':' characters since it's a reserved character in the query syntax.
 		// It would be impossible to do a query for one of these tags, so we must not allow it in the first place.
 		config := spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagNameWith:Character"}}
@@ -207,15 +252,31 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 	})
 	t.Run("Attempt to open a store with a blank name", func(t *testing.T) {
 		store, err := provider.OpenStore("")
+
 		require.Error(t, err)
 		require.Nil(t, store)
 	})
 	t.Run("Demonstrate that store names are not case-sensitive", func(t *testing.T) {
-		// Per the interface, store names are not supposed to be case sensitive in order to ensure consistency across
+		// Per the interface, store names are not supposed to be case-sensitive in order to ensure consistency across
 		// storage implementations - some of which don't support case sensitivity in their database names.
 
 		storeWithCapitalLetter, err := provider.OpenStore("Some-store-name")
 		require.NoError(t, err)
+
+		// Despite the different capitalization, this should still set the store config on the store opened above.
+		err = provider.SetStoreConfig("SoMe-stoRe-naMe", spi.StoreConfiguration{TagNames: []string{"TagName1"}})
+		require.NoError(t, err)
+
+		// Despite the different capitalization, this should still get the store config we set above.
+		storeConfig, err := provider.GetStoreConfig("sOME-sToRe-NamE")
+		require.NoError(t, err)
+
+		require.Len(t, storeConfig.TagNames, 1)
+		require.Equal(t, "TagName1", storeConfig.TagNames[0])
+
+		defer func() {
+			require.NoError(t, storeWithCapitalLetter.Close())
+		}()
 
 		err = storeWithCapitalLetter.Put("key", []byte("value"))
 		require.NoError(t, err)
@@ -224,6 +285,10 @@ func TestProviderOpenStoreSetGetConfig(t *testing.T, provider spi.Provider) { //
 		// contains the same data as the one above.
 		storeWithLowercaseLetter, err := provider.OpenStore("some-store-name")
 		require.NoError(t, err)
+
+		defer func() {
+			require.NoError(t, storeWithLowercaseLetter.Close())
+		}()
 
 		value, err := storeWithLowercaseLetter.Get("key")
 		require.NoError(t, err)
@@ -241,19 +306,35 @@ func TestProviderGetOpenStores(t *testing.T, provider spi.Provider) {
 	store1, err := provider.OpenStore("testStore1")
 	require.NoError(t, err)
 
+	defer func() {
+		// Although we close store1 later on as part of this test, in case it fails early we still need to make
+		// sure it's closed. Closing a store multiple times should not cause an error.
+		require.NoError(t, store1.Close())
+	}()
+
 	openStores = provider.GetOpenStores()
 	require.Len(t, openStores, 1)
 
 	store2, err := provider.OpenStore("testStore2")
 	require.NoError(t, err)
 
+	defer func() {
+		// Although we close store2 later on as part of this test, in case it fails early we still need to make
+		// sure it's closed. Closing a store multiple times should not cause an error.
+		require.NoError(t, store2.Close())
+	}()
+
 	openStores = provider.GetOpenStores()
 	require.Len(t, openStores, 2)
 
 	// Now we will attempt to open a previously opened store. Since it was opened previously, we expect that the
 	// number of open stores returned by GetOpenStores() to not change.
-	_, err = provider.OpenStore("testStore2")
+	store2Reopened, err := provider.OpenStore("testStore2")
 	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, store2Reopened.Close())
+	}()
 
 	openStores = provider.GetOpenStores()
 	require.Len(t, openStores, 2)
@@ -294,18 +375,20 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 
 	testValueSimpleString := "TestValue"
 	testValueSimpleString2 := "TestValue2"
-	testValueJSON := `{"someKey1":"someStringValue","someKey2":3,"someKey3":true}`
-	testValueJSON2 := `{"someKey1":"someStringValue2","someKey2":3,"someKey3":true}`
 	testBinaryData := []byte{0x5f, 0xcb, 0x5c, 0xe9, 0x7f, 0xe3, 0x81}
 	testBinaryData2 := []byte{0x5f, 0xcb, 0x5c, 0xe9, 0x7f}
+	testValueJSONString := `"TestValue"`
 
 	t.Run("Put and get a value", func(t *testing.T) {
 		t.Run("Key is not a URL", func(t *testing.T) {
 			t.Run("Value is simple text", func(t *testing.T) {
 				doPutThenGetTest(t, provider, testKeyNonURL, []byte(testValueSimpleString))
 			})
-			t.Run("Value is JSON-formatted text", func(t *testing.T) {
-				doPutThenGetTest(t, provider, testKeyNonURL, []byte(testValueJSON))
+			t.Run("Value is JSON-formatted object", func(t *testing.T) {
+				doPutThenGetTestWithJSONFormattedObject(t, provider, testKeyNonURL)
+			})
+			t.Run("Value is JSON-formatted string", func(t *testing.T) {
+				doPutThenGetTest(t, provider, testKeyNonURL, []byte(testValueJSONString))
 			})
 			t.Run("Value is binary data", func(t *testing.T) {
 				doPutThenGetTest(t, provider, testKeyNonURL, testBinaryData)
@@ -315,8 +398,11 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 			t.Run("Value is simple text", func(t *testing.T) {
 				doPutThenGetTest(t, provider, testKeyURL, []byte(testValueSimpleString))
 			})
-			t.Run("Value is JSON-formatted text", func(t *testing.T) {
-				doPutThenGetTest(t, provider, testKeyURL, []byte(testValueJSON))
+			t.Run("Value is JSON-formatted object", func(t *testing.T) {
+				doPutThenGetTestWithJSONFormattedObject(t, provider, testKeyURL)
+			})
+			t.Run("Value is JSON-formatted string", func(t *testing.T) {
+				doPutThenGetTest(t, provider, testKeyURL, []byte(testValueJSONString))
 			})
 			t.Run("Value is binary data", func(t *testing.T) {
 				doPutThenGetTest(t, provider, testKeyURL, testBinaryData)
@@ -329,8 +415,8 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 				doPutThenUpdateThenGetTest(t, provider, testKeyNonURL,
 					[]byte(testValueSimpleString), []byte(testValueSimpleString2))
 			})
-			t.Run("Value is JSON-formatted text", func(t *testing.T) {
-				doPutThenUpdateThenGetTest(t, provider, testKeyNonURL, []byte(testValueJSON), []byte(testValueJSON2))
+			t.Run("Value is JSON-formatted object", func(t *testing.T) {
+				doPutThenUpdateThenGetTestWithJSONFormattedObject(t, provider, testKeyNonURL)
 			})
 			t.Run("Value is binary data", func(t *testing.T) {
 				doPutThenUpdateThenGetTest(t, provider, testKeyNonURL, testBinaryData, testBinaryData2)
@@ -341,8 +427,8 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 				doPutThenUpdateThenGetTest(t, provider, testKeyURL, []byte(testValueSimpleString),
 					[]byte(testValueSimpleString2))
 			})
-			t.Run("Value is JSON-formatted text", func(t *testing.T) {
-				doPutThenUpdateThenGetTest(t, provider, testKeyURL, []byte(testValueJSON), []byte(testValueJSON2))
+			t.Run("Value is JSON-formatted object", func(t *testing.T) {
+				doPutThenUpdateThenGetTestWithJSONFormattedObject(t, provider, testKeyURL)
 			})
 			t.Run("Value is binary data", func(t *testing.T) {
 				doPutThenUpdateThenGetTest(t, provider, testKeyURL, testBinaryData, testBinaryData2)
@@ -352,6 +438,10 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 	t.Run("Put a single value, then delete it, then put again using the same key", func(t *testing.T) {
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
 
 		err = store.Put(testKeyNonURL, []byte(testValueSimpleString))
 		require.NoError(t, err)
@@ -372,11 +462,19 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 			store1, err := provider.OpenStore(randomStoreName())
 			require.NoError(t, err)
 
+			defer func() {
+				require.NoError(t, store1.Close())
+			}()
+
 			err = store1.Put(testKeyNonURL, []byte(testValueSimpleString))
 			require.NoError(t, err)
 
 			store2, err := provider.OpenStore(randomStoreName())
 			require.NoError(t, err)
+
+			defer func() {
+				require.NoError(t, store2.Close())
+			}()
 
 			// Store 2 should be disjoint from store 1. It should not contain the key + value pair from store 1.
 			value, err := store2.Get(testKeyNonURL)
@@ -389,11 +487,19 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 				store1, err := provider.OpenStore(randomStoreName())
 				require.NoError(t, err)
 
+				defer func() {
+					require.NoError(t, store1.Close())
+				}()
+
 				err = store1.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
 
 				store2, err := provider.OpenStore(randomStoreName())
 				require.NoError(t, err)
+
+				defer func() {
+					require.NoError(t, store2.Close())
+				}()
 
 				err = store2.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
@@ -422,11 +528,19 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 				store1, err := provider.OpenStore(randomStoreName())
 				require.NoError(t, err)
 
+				defer func() {
+					require.NoError(t, store1.Close())
+				}()
+
 				err = store1.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
 
 				store2, err := provider.OpenStore(randomStoreName())
 				require.NoError(t, err)
+
+				defer func() {
+					require.NoError(t, store2.Close())
+				}()
 
 				err = store2.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
@@ -455,12 +569,20 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 				store1, err := provider.OpenStore(storeName)
 				require.NoError(t, err)
 
+				defer func() {
+					require.NoError(t, store1.Close())
+				}()
+
 				err = store1.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
 
 				// Store 2 should contain the same data as store 1 since they were opened with the same name.
 				store2, err := provider.OpenStore(storeName)
 				require.NoError(t, err)
+
+				defer func() {
+					require.NoError(t, store2.Close())
+				}()
 
 				// Store 2 should find the same data that was put in store 1
 
@@ -480,12 +602,20 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 				store1, err := provider.OpenStore(storeName)
 				require.NoError(t, err)
 
+				defer func() {
+					require.NoError(t, store1.Close())
+				}()
+
 				err = store1.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
 
 				// Store 2 should contain the same data as store 1 since they were opened with the same name.
 				store2, err := provider.OpenStore(storeName)
 				require.NoError(t, err)
+
+				defer func() {
+					require.NoError(t, store2.Close())
+				}()
 
 				err = store2.Put(testKeyNonURL, []byte(testValueSimpleString))
 				require.NoError(t, err)
@@ -510,12 +640,20 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		_, err = store.Get("")
 		require.Error(t, err)
 	})
 	t.Run("Put with empty key", func(t *testing.T) {
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
 
 		err = store.Put("", []byte(testValueSimpleString))
 		require.Error(t, err)
@@ -524,6 +662,10 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		err = store.Put(testKeyNonURL, nil)
 		require.Error(t, err)
 	})
@@ -531,6 +673,10 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 		t.Run("First tag name contains a ':'", func(t *testing.T) {
 			store, err := provider.OpenStore(randomStoreName())
 			require.NoError(t, err)
+
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
 
 			err = store.Put(testKeyNonURL, []byte("value"),
 				[]spi.Tag{
@@ -543,6 +689,10 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 			store, err := provider.OpenStore(randomStoreName())
 			require.NoError(t, err)
 
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
 			err = store.Put(testKeyNonURL, []byte("value"),
 				[]spi.Tag{
 					{Name: "TagName1", Value: "TagValue1With:Character"},
@@ -554,6 +704,10 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 			store, err := provider.OpenStore(randomStoreName())
 			require.NoError(t, err)
 
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
 			err = store.Put(testKeyNonURL, []byte("value"),
 				[]spi.Tag{
 					{Name: "TagName1", Value: "TagValue1"},
@@ -564,6 +718,10 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 		t.Run("Second tag value contains a ':'", func(t *testing.T) {
 			store, err := provider.OpenStore(randomStoreName())
 			require.NoError(t, err)
+
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
 
 			err = store.Put(testKeyNonURL, []byte("value"),
 				[]spi.Tag{
@@ -578,24 +736,46 @@ func TestPutGet(t *testing.T, provider spi.Provider) { //nolint: funlen // Test 
 // TestStoreGetTags tests common Store GetTags functionality.
 func TestStoreGetTags(t *testing.T, provider spi.Provider) {
 	storeName := randomStoreName()
+
 	store, err := provider.OpenStore(storeName)
 	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
 
 	err = provider.SetStoreConfig(storeName,
 		spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2"}})
 	require.NoError(t, err)
 
 	t.Run("Successfully retrieve tags", func(t *testing.T) {
-		tags := []spi.Tag{{Name: "tagName1", Value: "tagValue1"}, {Name: "tagName2", Value: "tagValue2"}}
+		// For storage providers that support sorting, they may store numbers differently in order to allow them to
+		// sort correctly as per the storage interface documentation.
+		// These tests ensure that the tag values are still retrieved
+		t.Run("Tag values are strings", func(t *testing.T) {
+			tags := []spi.Tag{{Name: "tagName1", Value: "tagValue1"}, {Name: "tagName2", Value: "tagValue2"}}
 
-		key := "key"
+			key := "key"
 
-		err = store.Put(key, []byte("value1"), tags...)
-		require.NoError(t, err)
+			err = store.Put(key, []byte("value1"), tags...)
+			require.NoError(t, err)
 
-		receivedTags, err := store.GetTags(key)
-		require.NoError(t, err)
-		require.True(t, equalTags(tags, receivedTags), "Got unexpected tags")
+			receivedTags, errGetTags := store.GetTags(key)
+			require.NoError(t, errGetTags)
+			require.True(t, equalTags(tags, receivedTags), "Got unexpected tags")
+		})
+		t.Run("Tag values are decimal numbers", func(t *testing.T) {
+			tags := []spi.Tag{{Name: "tagName1", Value: "1"}, {Name: "tagName2", Value: "2"}}
+
+			key := "key2"
+
+			err = store.Put(key, []byte("value1"), tags...)
+			require.NoError(t, err)
+
+			receivedTags, errGetTags := store.GetTags(key)
+			require.NoError(t, errGetTags)
+			require.True(t, equalTags(tags, receivedTags), "Got unexpected tags")
+		})
 	})
 	t.Run("Data not found", func(t *testing.T) {
 		tags, err := store.GetTags("NonExistentKey")
@@ -616,6 +796,10 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		err = store.Put("key1", []byte("value1"),
 			[]spi.Tag{
 				{Name: "tagName1", Value: "tagValue1"},
@@ -623,7 +807,7 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 			}...)
 		require.NoError(t, err)
 
-		err = store.Put("key2", []byte("value2"),
+		err = store.Put("key2", []byte(`"value2"`),
 			[]spi.Tag{
 				{Name: "tagName1", Value: "tagValue1"},
 				{Name: "tagName2", Value: "tagValue2"},
@@ -634,30 +818,80 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 		require.NoError(t, err)
 		require.Len(t, values, 2)
 		require.Equal(t, "value1", string(values[0]))
-		require.Equal(t, "value2", string(values[1]))
+		require.Equal(t, `"value2"`, string(values[1]))
 	})
-	t.Run("One value found, one not", func(t *testing.T) {
-		store, err := provider.OpenStore(randomStoreName())
-		require.NoError(t, err)
-		require.NotNil(t, store)
+	t.Run("Two values found, one not", func(t *testing.T) {
+		t.Run("Value not found was the second one", func(t *testing.T) {
+			store, err := provider.OpenStore(randomStoreName())
+			require.NoError(t, err)
+			require.NotNil(t, store)
 
-		err = store.Put("key1", []byte("value1"),
-			[]spi.Tag{
-				{Name: "tagName1", Value: "tagValue1"},
-				{Name: "tagName2", Value: "tagValue2"},
-			}...)
-		require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
 
-		values, err := store.GetBulk("key1", "key2")
-		require.NoError(t, err)
-		require.Len(t, values, 2)
-		require.Equal(t, "value1", string(values[0]))
-		require.Nil(t, values[1])
+			err = store.Put("key1", []byte("value1"),
+				[]spi.Tag{
+					{Name: "tagName1", Value: "tagValue1"},
+					{Name: "tagName2", Value: "tagValue2"},
+				}...)
+			require.NoError(t, err)
+
+			err = store.Put("key2", []byte("value2"),
+				[]spi.Tag{
+					{Name: "tagName1", Value: "tagValue1"},
+					{Name: "tagName2", Value: "tagValue2"},
+				}...)
+			require.NoError(t, err)
+
+			values, err := store.GetBulk("key1", "nonexistentkey", "key2")
+			require.NoError(t, err)
+
+			require.Len(t, values, 3)
+			require.Equal(t, "value1", string(values[0]))
+			require.Nil(t, values[1])
+			require.Equal(t, "value2", string(values[2]))
+		})
+		t.Run("Value not found was the third one", func(t *testing.T) {
+			store, err := provider.OpenStore(randomStoreName())
+			require.NoError(t, err)
+			require.NotNil(t, store)
+
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			err = store.Put("key1", []byte("value1"),
+				[]spi.Tag{
+					{Name: "tagName1", Value: "tagValue1"},
+					{Name: "tagName2", Value: "tagValue2"},
+				}...)
+			require.NoError(t, err)
+
+			err = store.Put("key2", []byte("value2"),
+				[]spi.Tag{
+					{Name: "tagName1", Value: "tagValue1"},
+					{Name: "tagName2", Value: "tagValue2"},
+				}...)
+			require.NoError(t, err)
+
+			values, err := store.GetBulk("key1", "key2", "nonexistentkey")
+			require.NoError(t, err)
+
+			require.Len(t, values, 3)
+			require.Equal(t, "value1", string(values[0]))
+			require.Equal(t, "value2", string(values[1]))
+			require.Nil(t, values[2])
+		})
 	})
 	t.Run("One value found, one not because it was deleted", func(t *testing.T) {
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
 
 		err = store.Put("key1", []byte("value1"),
 			[]spi.Tag{
@@ -687,6 +921,10 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		err = store.Put("key1", []byte("value1"),
 			[]spi.Tag{
 				{Name: "tagName1", Value: "tagValue1"},
@@ -705,6 +943,10 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		values, err := store.GetBulk(nil...)
 		require.Error(t, err)
 		require.Nil(t, values)
@@ -714,6 +956,10 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		values, err := store.GetBulk(make([]string, 0)...)
 		require.Error(t, err)
 		require.Nil(t, values)
@@ -722,6 +968,10 @@ func TestStoreGetBulk(t *testing.T, provider spi.Provider) { //nolint: funlen //
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
 
 		values, err := store.GetBulk("key1", "key2", "")
 		require.Error(t, err)
@@ -737,6 +987,10 @@ func TestStoreDelete(t *testing.T, provider spi.Provider) {
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		err = store.Put(testKey, []byte("value1"))
 		require.NoError(t, err)
 
@@ -751,6 +1005,10 @@ func TestStoreDelete(t *testing.T, provider spi.Provider) {
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		err = store.Delete("NonExistentKey")
 		require.NoError(t, err)
 	})
@@ -758,15 +1016,822 @@ func TestStoreDelete(t *testing.T, provider spi.Provider) {
 		store, err := provider.OpenStore(randomStoreName())
 		require.NoError(t, err)
 
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
 		err = store.Delete("")
 		require.Error(t, err)
 	})
 }
 
 // TestStoreQuery tests common Store Query functionality.
-func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { // nolint: funlen // Test file
+func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) {
 	options := getOptions(opts)
 
+	doStoreQueryTests(t, provider, false, options)
+	doStoreQueryTests(t, provider, true, options)
+}
+
+// TestStoreQueryWithSortingAndInitialPageOptions tests common Store Query functionality when the sorting and initial
+// page options are used.
+func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, provider spi.Provider, opts ...TestOption) {
+	options := getOptions(opts)
+
+	if !options.onlySkipSortTestsThatDoNotSetStoreConfig {
+		doStoreQueryWithSortingAndInitialPageOptionsTests(t, provider, false, options)
+	}
+
+	doStoreQueryWithSortingAndInitialPageOptionsTests(t, provider, true, options)
+}
+
+// TestStoreBatch tests common Store Batch functionality.
+func TestStoreBatch(t *testing.T, provider spi.Provider) { // nolint:funlen // Test file
+	t.Run("Success: put three new values", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
+		require.NoError(t, err)
+
+		key1TagsToStore := []spi.Tag{{Name: "tagName1"}}
+		key2TagsToStore := []spi.Tag{{Name: "tagName2"}}
+		key3TagsToStore := []spi.Tag{{Name: "tagName3"}}
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1"), Tags: key1TagsToStore},
+			{Key: "key2", Value: []byte(`{"field":"value"}`), Tags: key2TagsToStore},
+			{Key: "key3", Value: []byte(`"value3"`), Tags: key3TagsToStore},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure all values and tags were stored
+
+		value, err := store.Get("key1")
+		require.NoError(t, err)
+		require.Equal(t, "value1", string(value))
+		retrievedTags, err := store.GetTags("key1")
+		require.True(t, equalTags(key1TagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key2")
+		require.NoError(t, err)
+		require.Equal(t, `{"field":"value"}`, string(value))
+		retrievedTags, err = store.GetTags("key2")
+		require.True(t, equalTags(key2TagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key3")
+		require.NoError(t, err)
+		require.Equal(t, `"value3"`, string(value))
+		retrievedTags, err = store.GetTags("key3")
+		require.True(t, equalTags(key3TagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+	})
+	t.Run("Success: update three different previously-stored values", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{
+				"tagName1", "tagName2", "tagName3",
+				"tagName2_new", "tagName3_new",
+			}})
+		require.NoError(t, err)
+
+		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
+		require.NoError(t, err)
+
+		err = store.Put("key2", []byte("value2"), []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}...)
+		require.NoError(t, err)
+
+		err = store.Put("key3", []byte("value3"), []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}...)
+		require.NoError(t, err)
+
+		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
+		key2UpdatedTagsToStore := []spi.Tag{{Name: "tagName2_new", Value: "tagValue2"}}
+		key3UpdatedTagsToStore := []spi.Tag{{Name: "tagName3_new", Value: "tagValue3_new"}}
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore},
+			{Key: "key2", Value: []byte("value2_new"), Tags: key2UpdatedTagsToStore},
+			{Key: "key3", Value: []byte("value3_new"), Tags: key3UpdatedTagsToStore},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure all values and tags were stored
+
+		value, err := store.Get("key1")
+		require.NoError(t, err)
+		require.Equal(t, "value1_new", string(value))
+		retrievedTags, err := store.GetTags("key1")
+		require.True(t, equalTags(key1UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key2")
+		require.NoError(t, err)
+		require.Equal(t, "value2_new", string(value))
+		retrievedTags, err = store.GetTags("key2")
+		require.True(t, equalTags(key2UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key3")
+		require.NoError(t, err)
+		require.Equal(t, "value3_new", string(value))
+		retrievedTags, err = store.GetTags("key3")
+		require.True(t, equalTags(key3UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+	})
+	t.Run("Success: delete three different previously-stored values", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
+		require.NoError(t, err)
+
+		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
+		require.NoError(t, err)
+
+		err = store.Put("key2", []byte("value2"), []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}...)
+		require.NoError(t, err)
+
+		err = store.Put("key3", []byte("value3"), []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}...)
+		require.NoError(t, err)
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: nil, Tags: nil},
+			{Key: "key2", Value: nil, Tags: nil},
+			{Key: "key3", Value: nil, Tags: nil},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure the values can't be found now
+
+		value, err := store.Get("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err := store.GetTags("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+
+		value, err = store.Get("key2")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err = store.GetTags("key2")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+
+		value, err = store.Get("key3")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err = store.GetTags("key3")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+	})
+	t.Run("Success: put one value, update one value, delete one value", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
+		require.NoError(t, err)
+
+		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
+		require.NoError(t, err)
+
+		err = store.Put("key2", []byte("value2"), []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}...)
+		require.NoError(t, err)
+
+		key3TagsToStore := []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}
+
+		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
+
+		operations := []spi.Operation{
+			{Key: "key3", Value: []byte("value3"), Tags: key3TagsToStore},            // Put
+			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore}, // Update
+			{Key: "key2", Value: nil, Tags: nil},                                     // Delete
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		value, err := store.Get("key3")
+		require.NoError(t, err)
+		require.Equal(t, "value3", string(value))
+		retrievedTags, err := store.GetTags("key3")
+		require.True(t, equalTags(key3TagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key1")
+		require.NoError(t, err)
+		require.Equal(t, "value1_new", string(value))
+		retrievedTags, err = store.GetTags("key1")
+		require.True(t, equalTags(key1UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key2")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		retrievedTags, err = store.GetTags("key2")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, retrievedTags)
+	})
+	t.Run("Success: delete three values, only two of which were previously-stored", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
+		require.NoError(t, err)
+
+		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
+		require.NoError(t, err)
+
+		err = store.Put("key3", []byte("value3"), []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}...)
+		require.NoError(t, err)
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: nil, Tags: nil},
+			{Key: "key5", Value: []byte("whatever"), Tags: nil},
+			{Key: "key2", Value: nil, Tags: nil}, // key2 doesn't exist in the store, but this should not cause an error
+			{Key: "key3", Value: nil, Tags: nil},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure the values can't be found now
+
+		value, err := store.Get("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err := store.GetTags("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+
+		value, err = store.Get("key3")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err = store.GetTags("key3")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+	})
+	t.Run("Success: put value and then delete it in the same Batch call", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1"}})
+		require.NoError(t, err)
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
+			{Key: "key1", Value: nil, Tags: nil},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure that the delete effectively "overrode" the put in the Batch call.
+
+		value, err := store.Get("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err := store.GetTags("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+	})
+	t.Run("Success: put value and update it in the same Batch call", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
+		require.NoError(t, err)
+
+		updatedTagsToStore := []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
+			{Key: "key1", Value: []byte("value2"), Tags: updatedTagsToStore},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure that the second put operation effectively "overrode" the first operation
+		// from the user's perspective.
+
+		value, err := store.Get("key1")
+		require.NoError(t, err)
+		require.Equal(t, "value2", string(value))
+		retrievedTags, err := store.GetTags("key1")
+		require.True(t, equalTags(updatedTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+	})
+	t.Run("Success: update previously-stored value and delete it in the same Batch call", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{
+				"tagName1", "tagName2", "tagName3",
+				"tagName2_new", "tagName3_new",
+			}})
+		require.NoError(t, err)
+
+		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
+		require.NoError(t, err)
+
+		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore},
+			{Key: "key1"},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure the value can't be found now
+
+		value, err := store.Get("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, value)
+		tags, err := store.GetTags("key1")
+		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
+		require.Nil(t, tags)
+	})
+	t.Run("Success: update previously-stored value, then delete it, "+
+		"then put it in again using the same key from the first operation, "+
+		"all in the same Batch call", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{
+				"tagName1", "tagName2", "tagName3",
+				"tagName2_new", "tagName3_new",
+			}})
+		require.NoError(t, err)
+
+		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
+		require.NoError(t, err)
+
+		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
+		key1SecondUpdatedTagsToStore := []spi.Tag{{Name: "tagName2"}}
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore},
+			{Key: "key1"},
+			{Key: "key1", Value: []byte("value1_new2"), Tags: key1SecondUpdatedTagsToStore},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure that the third operation effectively "overrode" the first two
+		// from the user's perspective.
+
+		value, err := store.Get("key1")
+		require.NoError(t, err)
+		require.Equal(t, "value1_new2", string(value))
+		retrievedTags, err := store.GetTags("key1")
+		require.True(t, equalTags(key1SecondUpdatedTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+	})
+	t.Run("Success: put values in one batch call, then delete in a second batch call, then put again using "+
+		"the same keys that were used in the first batch call in a third batch call", func(t *testing.T) {
+		storeName := randomStoreName()
+
+		store, err := provider.OpenStore(storeName)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = provider.SetStoreConfig(storeName,
+			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
+		require.NoError(t, err)
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
+			{Key: "key2", Value: []byte("value2"), Tags: []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}},
+			{Key: "key3", Value: []byte("value3"), Tags: []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		operations = []spi.Operation{
+			{Key: "key1", Value: nil},
+			{Key: "key2", Value: nil},
+			{Key: "key3", Value: nil},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		key1FinalTagsToStore := []spi.Tag{{Name: "tagName1_new", Value: "tagValue1_new"}}
+		key2FinalTagsToStore := []spi.Tag{{Name: "tagName2_new", Value: "tagValue2_new"}}
+		key3FinalTagsToStore := []spi.Tag{{Name: "tagName3_new", Value: "tagValue3_new"}}
+
+		operations = []spi.Operation{
+			{Key: "key1", Value: []byte("value1_new"), Tags: key1FinalTagsToStore},
+			{Key: "key2", Value: []byte("value2_new"), Tags: key2FinalTagsToStore},
+			{Key: "key3", Value: []byte("value3_new"), Tags: key3FinalTagsToStore},
+		}
+
+		err = store.Batch(operations)
+		require.NoError(t, err)
+
+		// Check and make sure the new values were stored
+
+		value, err := store.Get("key1")
+		require.NoError(t, err)
+		require.Equal(t, "value1_new", string(value))
+		retrievedTags, err := store.GetTags("key1")
+		require.True(t, equalTags(key1FinalTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key2")
+		require.NoError(t, err)
+		require.Equal(t, "value2_new", string(value))
+		retrievedTags, err = store.GetTags("key2")
+		require.True(t, equalTags(key2FinalTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+
+		value, err = store.Get("key3")
+		require.NoError(t, err)
+		require.Equal(t, "value3_new", string(value))
+		retrievedTags, err = store.GetTags("key3")
+		require.True(t, equalTags(key3FinalTagsToStore, retrievedTags), "Got unexpected tags")
+		require.NoError(t, err)
+	})
+	t.Run("Failure: Operations slice is nil", func(t *testing.T) {
+		store, err := provider.OpenStore(randomStoreName())
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = store.Batch(nil)
+		require.Error(t, err)
+	})
+	t.Run("Failure: Operations slice is empty", func(t *testing.T) {
+		store, err := provider.OpenStore(randomStoreName())
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = store.Batch([]spi.Operation{})
+		require.Error(t, err)
+	})
+	t.Run("Failure: Operation has an empty key", func(t *testing.T) {
+		store, err := provider.OpenStore(randomStoreName())
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		operations := []spi.Operation{
+			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
+			{Key: "", Value: []byte("value2"), Tags: []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}},
+		}
+
+		err = store.Batch(operations)
+		require.Error(t, err)
+	})
+}
+
+// TestStoreFlush tests common Store Flush functionality.
+func TestStoreFlush(t *testing.T, provider spi.Provider) {
+	t.Run("Success", func(t *testing.T) {
+		store, err := provider.OpenStore(randomStoreName())
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		err = store.Put("key1", []byte("value1"))
+		require.NoError(t, err)
+
+		err = store.Put("key2", []byte("value2"))
+		require.NoError(t, err)
+
+		err = store.Flush()
+		require.NoError(t, err)
+
+		values, err := store.GetBulk("key1", "key2")
+		require.NoError(t, err)
+		require.Len(t, values, 2)
+		require.Equal(t, "value1", string(values[0]))
+		require.Equal(t, "value2", string(values[1]))
+	})
+}
+
+// TestStoreClose tests common Store Close functionality.
+func TestStoreClose(t *testing.T, provider spi.Provider) {
+	t.Run("Successfully close store", func(t *testing.T) {
+		store, err := provider.OpenStore(randomStoreName())
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		err = store.Close()
+		require.NoError(t, err)
+	})
+	t.Run("Close same store multiple times without error", func(t *testing.T) {
+		store, err := provider.OpenStore(randomStoreName())
+		require.NoError(t, err)
+		require.NotNil(t, store)
+
+		err = store.Close()
+		require.NoError(t, err)
+
+		err = store.Close()
+		require.NoError(t, err)
+
+		err = store.Close()
+		require.NoError(t, err)
+	})
+}
+
+func doPutThenGetTest(t *testing.T, provider spi.Provider, key string, value []byte) {
+	store, err := provider.OpenStore(randomStoreName())
+	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
+
+	err = store.Put(key, value)
+	require.NoError(t, err)
+
+	retrievedValue, err := store.Get(key)
+	require.NoError(t, err)
+	require.Equal(t, value, retrievedValue)
+}
+
+type testStruct struct {
+	String string `json:"string"`
+
+	Test1Bool bool `json:"test1Bool"`
+	Test2Bool bool `json:"test2Bool"`
+
+	BigNegativeInt32   int32 `json:"bigNegativeInt32"`
+	SmallNegativeInt32 int32 `json:"smallNegativeInt32"`
+	ZeroInt32          int32 `json:"zeroInt32"`
+	SmallPositiveInt32 int32 `json:"smallPositiveInt32"`
+	BigPositiveInt32   int32 `json:"bigPositiveInt32"`
+
+	BigNegativeInt64   int64 `json:"bigNegativeInt64"`
+	SmallNegativeInt64 int64 `json:"smallNegativeInt64"`
+	ZeroInt64          int64 `json:"zeroInt64"`
+	SmallPositiveInt64 int64 `json:"smallPositiveInt64"`
+	BigPositiveInt64   int64 `json:"bigPositiveInt64"`
+
+	Test1Float32 float32 `json:"test1Float32"`
+	Test2Float32 float32 `json:"test2Float32"`
+	Test3Float32 float32 `json:"test3Float32"`
+	Test4Float32 float32 `json:"test4Float32"`
+	Test5Float32 float32 `json:"test5Float32"`
+	ZeroFloat32  float32 `json:"zeroFloat32"`
+
+	Test1Float64 float64 `json:"test1Float64"`
+	Test2Float64 float64 `json:"test2Float64"`
+	Test3Float64 float64 `json:"test3Float64"`
+	Test4Float64 float64 `json:"test4Float64"`
+	Test5Float64 float32 `json:"test5Float64"`
+	ZeroFloat64  float64 `json:"zeroFloat64"`
+}
+
+func doPutThenGetTestWithJSONFormattedObject(t *testing.T, provider spi.Provider, key string) {
+	store, err := provider.OpenStore(randomStoreName())
+	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
+
+	storedTestData := storeTestJSONData(t, store, key)
+
+	retrievedValue, err := store.Get(key)
+	require.NoError(t, err)
+
+	checkIfTestStructsMatch(t, retrievedValue, &storedTestData)
+}
+
+func doPutThenUpdateThenGetTest(t *testing.T, provider spi.Provider, key string, value, updatedValue []byte) {
+	store, err := provider.OpenStore(randomStoreName())
+	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
+
+	err = store.Put(key, value)
+	require.NoError(t, err)
+
+	err = store.Put(key, updatedValue)
+	require.NoError(t, err)
+
+	retrievedValue, err := store.Get(key)
+	require.NoError(t, err)
+	require.Equal(t, updatedValue, retrievedValue)
+}
+
+func doPutThenUpdateThenGetTestWithJSONFormattedObject(t *testing.T, provider spi.Provider, key string) {
+	store, err := provider.OpenStore(randomStoreName())
+	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, store.Close())
+	}()
+
+	storedTestData := storeTestJSONData(t, store, key)
+
+	storedTestData.String = "Some new string here"
+	storedTestData.Test1Bool = true
+	storedTestData.BigNegativeInt32 = -12345 //nolint:gomnd // Test file
+	storedTestData.BigPositiveInt64 = 90000004
+	storedTestData.Test3Float32 = 7.42
+	storedTestData.Test3Float64 = -72.4208 //nolint:gomnd // Test file
+
+	testDataBytes, err := json.Marshal(storedTestData)
+	require.NoError(t, err)
+
+	err = store.Put(key, testDataBytes)
+	require.NoError(t, err)
+
+	retrievedValue, err := store.Get(key)
+	require.NoError(t, err)
+
+	checkIfTestStructsMatch(t, retrievedValue, &storedTestData)
+}
+
+func storeTestJSONData(t *testing.T, store spi.Store, key string) testStruct {
+	testData := testStruct{
+		String: "Some string here",
+
+		Test1Bool: false,
+		Test2Bool: true,
+
+		BigNegativeInt32:   -2147483648,
+		SmallNegativeInt32: -3,
+		ZeroInt32:          0,
+		SmallPositiveInt32: 3,          //nolint:gomnd // Test file
+		BigPositiveInt32:   2147483647, //nolint:gomnd // Test file
+
+		BigNegativeInt64:   -9223372036854775808,
+		SmallNegativeInt64: -3,
+		ZeroInt64:          0,
+		SmallPositiveInt64: 3,                   //nolint:gomnd // Test file
+		BigPositiveInt64:   9223372036854775807, //nolint:gomnd // Test file
+
+		Test1Float32: 1.3,
+		Test2Float32: 16, //nolint:gomnd // Test file
+		Test3Float32: 1.5869797,
+		Test4Float32: 239.902, //nolint:gomnd // Test file
+		Test5Float32: -239.902,
+		ZeroFloat32:  0.00, //nolint:gomnd // Test file
+
+		Test1Float64: 0.12345678912345678, //nolint:gomnd // Test file
+		Test2Float64: -478.875321,
+		Test3Float64: 123456789, //nolint:gomnd // Test file
+		Test4Float64: 1.00000004,
+		Test5Float64: -239.902,
+		ZeroFloat64:  0.0000, //nolint:gomnd // Test file
+	}
+
+	testDataBytes, err := json.Marshal(testData)
+	require.NoError(t, err)
+
+	err = store.Put(key, testDataBytes)
+	require.NoError(t, err)
+
+	return testData
+}
+
+func checkIfTestStructsMatch(t *testing.T, retrievedValue []byte, storedTestData *testStruct) {
+	var retrievedTestData testStruct
+
+	err := json.Unmarshal(retrievedValue, &retrievedTestData)
+	require.NoError(t, err)
+
+	require.Equal(t, storedTestData.String, retrievedTestData.String)
+
+	require.Equal(t, storedTestData.Test1Bool, retrievedTestData.Test1Bool)
+	require.Equal(t, storedTestData.Test2Bool, retrievedTestData.Test2Bool)
+
+	require.Equal(t, storedTestData.BigNegativeInt32, retrievedTestData.BigNegativeInt32)
+	require.Equal(t, storedTestData.SmallNegativeInt32, retrievedTestData.SmallNegativeInt32)
+	require.Equal(t, storedTestData.ZeroInt32, retrievedTestData.ZeroInt32)
+	require.Equal(t, storedTestData.SmallPositiveInt32, retrievedTestData.SmallPositiveInt32)
+	require.Equal(t, storedTestData.BigPositiveInt32, retrievedTestData.BigPositiveInt32)
+
+	require.Equal(t, storedTestData.BigNegativeInt64, retrievedTestData.BigNegativeInt64)
+	require.Equal(t, storedTestData.SmallNegativeInt64, retrievedTestData.SmallNegativeInt64)
+	require.Equal(t, storedTestData.ZeroInt64, retrievedTestData.ZeroInt64)
+	require.Equal(t, storedTestData.SmallPositiveInt64, retrievedTestData.SmallPositiveInt64)
+	require.Equal(t, storedTestData.BigPositiveInt64, retrievedTestData.BigPositiveInt64)
+
+	require.Equal(t, storedTestData.Test1Float32, retrievedTestData.Test1Float32)
+	require.Equal(t, storedTestData.Test2Float32, retrievedTestData.Test2Float32)
+	require.Equal(t, storedTestData.Test3Float32, retrievedTestData.Test3Float32)
+	require.Equal(t, storedTestData.Test4Float32, retrievedTestData.Test4Float32)
+	require.Equal(t, storedTestData.ZeroFloat32, retrievedTestData.ZeroFloat32)
+
+	require.Equal(t, storedTestData.Test1Float64, retrievedTestData.Test1Float64)
+	require.Equal(t, storedTestData.Test2Float64, retrievedTestData.Test2Float64)
+	require.Equal(t, storedTestData.Test3Float64, retrievedTestData.Test3Float64)
+	require.Equal(t, storedTestData.Test4Float64, retrievedTestData.Test4Float64)
+	require.Equal(t, storedTestData.ZeroFloat64, retrievedTestData.ZeroFloat64)
+}
+
+func doStoreQueryTests(t *testing.T, // nolint: funlen,gocognit,gocyclo // Test file
+	provider spi.Provider, setStoreConfig bool, options testOptions) {
 	t.Run("Tag name only query - 2 values found", func(t *testing.T) {
 		keysToPut := []string{"key1", "key2", "key3"}
 		valuesToPut := [][]byte{[]byte("value1"), []byte("value2"), []byte("value3")}
@@ -790,9 +1855,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -800,7 +1871,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 2", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -809,9 +1880,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -820,7 +1897,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 1", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -829,9 +1906,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -839,7 +1922,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 100", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -848,9 +1931,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -859,7 +1948,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 	})
 	t.Run("Tag name only query - 0 values found", func(t *testing.T) {
@@ -882,9 +1971,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -892,7 +1987,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, nil, nil, nil, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 2", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -901,9 +1996,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -912,7 +2013,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, nil, nil, nil,
-				false, options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				false, determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 1", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -921,9 +2022,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -931,7 +2038,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, nil, nil, nil, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 100", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -940,9 +2047,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4", "tagName5"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -951,7 +2064,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, nil, nil, nil, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 	})
 	t.Run("Tag name and value query - 2 values found", func(t *testing.T) {
@@ -978,9 +2091,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -988,7 +2107,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 2", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -997,9 +2116,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -1008,7 +2133,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 1", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -1017,9 +2142,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -1027,7 +2158,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 		t.Run("Page size 100", func(t *testing.T) {
 			storeName := randomStoreName()
@@ -1036,9 +2167,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName,
-				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName,
+					spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -1047,7 +2184,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 			require.NoError(t, err)
 
 			verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-				options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+				determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 		})
 	})
 	t.Run("Tag name and value query - only 1 value found "+
@@ -1072,9 +2209,15 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		if setStoreConfig {
+			err = provider.SetStoreConfig(storeName,
+				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+			require.NoError(t, err)
+		}
 
 		putData(t, store, keysToPut, valuesToPut, tagsToPut)
 
@@ -1085,7 +2228,7 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 		require.NoError(t, err)
 
 		verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, false,
-			options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+			determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 	})
 	t.Run("Tag name and value query - 0 values found since the store is empty", func(t *testing.T) {
 		storeName := randomStoreName()
@@ -1094,15 +2237,21 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
-		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		if setStoreConfig {
+			err = provider.SetStoreConfig(storeName,
+				spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3", "tagName4"}})
+			require.NoError(t, err)
+		}
 
 		iterator, err := store.Query("tagName3:tagValue1")
 		require.NoError(t, err)
 
 		verifyExpectedIterator(t, iterator, nil, nil, nil, false,
-			options.checkIteratorTotalItemCounts, 0)
+			determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), 0)
 	})
 	t.Run("Invalid expression formats", func(t *testing.T) {
 		storeName := randomStoreName()
@@ -1111,8 +2260,14 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 		require.NoError(t, err)
 		require.NotNil(t, store)
 
-		err = provider.SetStoreConfig(storeName, spi.StoreConfiguration{})
-		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, store.Close())
+		}()
+
+		if setStoreConfig {
+			err = provider.SetStoreConfig(storeName, spi.StoreConfiguration{})
+			require.NoError(t, err)
+		}
 
 		t.Run("Empty expression", func(t *testing.T) {
 			iterator, err := store.Query("")
@@ -1127,12 +2282,8 @@ func TestStoreQuery(t *testing.T, provider spi.Provider, opts ...TestOption) { /
 	})
 }
 
-// TestStoreQueryWithSortingAndInitialPageOptions tests common Store Query functionality when the sorting and initial
-// page options are used.
-func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funlen // Test file
-	provider spi.Provider, opts ...TestOption) {
-	options := getOptions(opts)
-
+func doStoreQueryWithSortingAndInitialPageOptionsTests(t *testing.T, // nolint: funlen // Test file
+	provider spi.Provider, setStoreConfig bool, options testOptions) {
 	t.Run("Sorting by a small numerical tag", func(t *testing.T) { //nolint: dupl // Test file
 		keysToPutAscendingOrder := []string{
 			"key1", "key2", "key3", "key4", "key5", "key6",
@@ -1205,8 +2356,14 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName, storeConfig)
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName, storeConfig)
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPutAscendingOrder, valuesToPutAscendingOrder, tagsToPutAscendingOrder)
 
@@ -1227,7 +2384,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -1245,7 +2402,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1262,7 +2419,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1291,7 +2448,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1317,7 +2474,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page (but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -1331,7 +2488,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -1368,7 +2525,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -1400,7 +2557,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1432,7 +2589,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1461,7 +2618,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1487,7 +2644,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page(but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -1501,7 +2658,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -1513,8 +2670,14 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName, storeConfig)
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName, storeConfig)
+				require.NoError(t, err)
+			}
 
 			keysToPutArbitraryOrder := []string{
 				keysToPutAscendingOrder[5], keysToPutAscendingOrder[1], keysToPutAscendingOrder[9],
@@ -1554,7 +2717,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -1572,7 +2735,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1589,7 +2752,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1618,7 +2781,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1644,7 +2807,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page(but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -1658,7 +2821,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -1695,7 +2858,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -1728,7 +2891,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1760,7 +2923,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1789,7 +2952,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1815,7 +2978,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page"+
 						"(but there should only be four pages max, so iterator should have no results)", func(t *testing.T) {
@@ -1829,7 +2992,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -1906,8 +3069,14 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName, storeConfig)
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName, storeConfig)
+				require.NoError(t, err)
+			}
 
 			putData(t, store, keysToPutAscendingOrder, valuesToPutAscendingOrder, tagsToPutAscendingOrder)
 
@@ -1928,7 +3097,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -1946,7 +3115,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1963,7 +3132,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -1992,7 +3161,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2018,7 +3187,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page(but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -2032,7 +3201,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -2069,7 +3238,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -2102,7 +3271,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2134,7 +3303,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2163,7 +3332,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2189,7 +3358,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page(but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -2203,7 +3372,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -2215,8 +3384,14 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 			require.NoError(t, err)
 			require.NotNil(t, store)
 
-			err = provider.SetStoreConfig(storeName, storeConfig)
-			require.NoError(t, err)
+			defer func() {
+				require.NoError(t, store.Close())
+			}()
+
+			if setStoreConfig {
+				err = provider.SetStoreConfig(storeName, storeConfig)
+				require.NoError(t, err)
+			}
 
 			keysToPutArbitraryOrder := []string{
 				keysToPutAscendingOrder[5], keysToPutAscendingOrder[1], keysToPutAscendingOrder[9],
@@ -2256,7 +3431,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -2274,7 +3449,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2291,7 +3466,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						expectedTags := tagsToPutAscendingOrder
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2320,7 +3495,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2346,7 +3521,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page(but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -2360,7 +3535,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -2397,7 +3572,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 				t.Run("Page size 3", func(t *testing.T) {
@@ -2430,7 +3605,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at first page (explicitly set)", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2462,7 +3637,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at second page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2491,7 +3666,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at third page", func(t *testing.T) {
 						iterator, err := store.Query(queryExpression,
@@ -2517,7 +3692,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						}
 
 						verifyExpectedIterator(t, iterator, expectedKeys, expectedValues, expectedTags, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 					t.Run("Start at fifth page(but there should only be four pages max, "+
 						"so iterator should have no results)", func(t *testing.T) {
@@ -2531,7 +3706,7 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 						require.NoError(t, err)
 
 						verifyExpectedIterator(t, iterator, nil, nil, nil, true,
-							options.checkIteratorTotalItemCounts, expectedTotalItemsCount)
+							determineWhetherToCheckIteratorTotalItemCounts(options, setStoreConfig), expectedTotalItemsCount)
 					})
 				})
 			})
@@ -2539,485 +3714,16 @@ func TestStoreQueryWithSortingAndInitialPageOptions(t *testing.T, //nolint: funl
 	})
 }
 
-// TestStoreBatch tests common Store Batch functionality.
-func TestStoreBatch(t *testing.T, provider spi.Provider) { // nolint:funlen // Test file
-	t.Run("Success: put three new values", func(t *testing.T) {
-		storeName := randomStoreName()
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
-		require.NoError(t, err)
-
-		key1TagsToStore := []spi.Tag{{Name: "tagName1"}}
-		key2TagsToStore := []spi.Tag{{Name: "tagName2"}}
-		key3TagsToStore := []spi.Tag{{Name: "tagName3"}}
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1"), Tags: key1TagsToStore},
-			{Key: "key2", Value: []byte("value2"), Tags: key2TagsToStore},
-			{Key: "key3", Value: []byte("value3"), Tags: key3TagsToStore},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure all values and tags were stored
-
-		value, err := store.Get("key1")
-		require.NoError(t, err)
-		require.Equal(t, "value1", string(value))
-		retrievedTags, err := store.GetTags("key1")
-		require.True(t, equalTags(key1TagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-
-		value, err = store.Get("key2")
-		require.NoError(t, err)
-		require.Equal(t, "value2", string(value))
-		retrievedTags, err = store.GetTags("key2")
-		require.True(t, equalTags(key2TagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-
-		value, err = store.Get("key3")
-		require.NoError(t, err)
-		require.Equal(t, "value3", string(value))
-		retrievedTags, err = store.GetTags("key3")
-		require.True(t, equalTags(key3TagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-	})
-	t.Run("Success: update three different previously-stored values", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{
-				"tagName1", "tagName2", "tagName3",
-				"tagName2_new", "tagName3_new",
-			}})
-		require.NoError(t, err)
-
-		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
-		require.NoError(t, err)
-
-		err = store.Put("key2", []byte("value2"), []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}...)
-		require.NoError(t, err)
-
-		err = store.Put("key3", []byte("value3"), []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}...)
-		require.NoError(t, err)
-
-		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
-		key2UpdatedTagsToStore := []spi.Tag{{Name: "tagName2_new", Value: "tagValue2"}}
-		key3UpdatedTagsToStore := []spi.Tag{{Name: "tagName3_new", Value: "tagValue3_new"}}
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore},
-			{Key: "key2", Value: []byte("value2_new"), Tags: key2UpdatedTagsToStore},
-			{Key: "key3", Value: []byte("value3_new"), Tags: key3UpdatedTagsToStore},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure all values and tags were stored
-
-		value, err := store.Get("key1")
-		require.NoError(t, err)
-		require.Equal(t, "value1_new", string(value))
-		retrievedTags, err := store.GetTags("key1")
-		require.True(t, equalTags(key1UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-
-		value, err = store.Get("key2")
-		require.NoError(t, err)
-		require.Equal(t, "value2_new", string(value))
-		retrievedTags, err = store.GetTags("key2")
-		require.True(t, equalTags(key2UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-
-		value, err = store.Get("key3")
-		require.NoError(t, err)
-		require.Equal(t, "value3_new", string(value))
-		retrievedTags, err = store.GetTags("key3")
-		require.True(t, equalTags(key3UpdatedTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-	})
-	t.Run("Success: delete three different previously-stored values", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
-		require.NoError(t, err)
-
-		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
-		require.NoError(t, err)
-
-		err = store.Put("key2", []byte("value2"), []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}...)
-		require.NoError(t, err)
-
-		err = store.Put("key3", []byte("value3"), []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}...)
-		require.NoError(t, err)
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: nil, Tags: nil},
-			{Key: "key2", Value: nil, Tags: nil},
-			{Key: "key3", Value: nil, Tags: nil},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure the values can't be found now
-
-		value, err := store.Get("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err := store.GetTags("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-
-		value, err = store.Get("key2")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err = store.GetTags("key2")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-
-		value, err = store.Get("key3")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err = store.GetTags("key3")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-	})
-	t.Run("Success: delete three values, only two of which were previously-stored", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
-		require.NoError(t, err)
-
-		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
-		require.NoError(t, err)
-
-		err = store.Put("key3", []byte("value3"), []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}...)
-		require.NoError(t, err)
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: nil, Tags: nil},
-			{Key: "key2", Value: nil, Tags: nil}, // key2 doesn't exist in the store, but this should not cause an error
-			{Key: "key3", Value: nil, Tags: nil},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure the values can't be found now
-
-		value, err := store.Get("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err := store.GetTags("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-
-		value, err = store.Get("key3")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err = store.GetTags("key3")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-	})
-	t.Run("Success: put value and then delete it in the same Batch call", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1"}})
-		require.NoError(t, err)
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
-			{Key: "key1", Value: nil, Tags: nil},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure that the delete effectively "overrode" the put in the Batch call.
-
-		value, err := store.Get("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err := store.GetTags("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-	})
-	t.Run("Success: put value and update it in the same Batch call", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
-		require.NoError(t, err)
-
-		updatedTagsToStore := []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
-			{Key: "key1", Value: []byte("value2"), Tags: updatedTagsToStore},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure that the second put operation effectively "overrode" the first operation
-		// from the user's perspective.
-
-		value, err := store.Get("key1")
-		require.NoError(t, err)
-		require.Equal(t, "value2", string(value))
-		retrievedTags, err := store.GetTags("key1")
-		require.True(t, equalTags(updatedTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-	})
-	t.Run("Success: update previously-stored value and delete it in the same Batch call", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{
-				"tagName1", "tagName2", "tagName3",
-				"tagName2_new", "tagName3_new",
-			}})
-		require.NoError(t, err)
-
-		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
-		require.NoError(t, err)
-
-		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore},
-			{Key: "key1"},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure the value can't be found now
-
-		value, err := store.Get("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, value)
-		tags, err := store.GetTags("key1")
-		require.True(t, errors.Is(err, spi.ErrDataNotFound), "got unexpected error or no error")
-		require.Nil(t, tags)
-	})
-	t.Run("Success: update previously-stored value, then delete it, "+
-		"then put it in again using the same key from the first operation, "+
-		"all in the same Batch call", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{
-				"tagName1", "tagName2", "tagName3",
-				"tagName2_new", "tagName3_new",
-			}})
-		require.NoError(t, err)
-
-		err = store.Put("key1", []byte("value1"), []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}...)
-		require.NoError(t, err)
-
-		key1UpdatedTagsToStore := []spi.Tag{{Name: "tagName1"}}
-		key1SecondUpdatedTagsToStore := []spi.Tag{{Name: "tagName2"}}
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1_new"), Tags: key1UpdatedTagsToStore},
-			{Key: "key1"},
-			{Key: "key1", Value: []byte("value1_new2"), Tags: key1SecondUpdatedTagsToStore},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure that the third operation effectively "overrode" the first two
-		// from the user's perspective.
-
-		value, err := store.Get("key1")
-		require.NoError(t, err)
-		require.Equal(t, "value1_new2", string(value))
-		retrievedTags, err := store.GetTags("key1")
-		require.True(t, equalTags(key1SecondUpdatedTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-	})
-	t.Run("Success: put values in one batch call, then delete in a second batch call, then put again using "+
-		"the same keys that were used in the first batch call in a third batch call", func(t *testing.T) {
-		storeName := randomStoreName()
-
-		store, err := provider.OpenStore(storeName)
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = provider.SetStoreConfig(storeName,
-			spi.StoreConfiguration{TagNames: []string{"tagName1", "tagName2", "tagName3"}})
-		require.NoError(t, err)
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
-			{Key: "key2", Value: []byte("value2"), Tags: []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}},
-			{Key: "key3", Value: []byte("value3"), Tags: []spi.Tag{{Name: "tagName3", Value: "tagValue3"}}},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		operations = []spi.Operation{
-			{Key: "key1", Value: nil},
-			{Key: "key2", Value: nil},
-			{Key: "key3", Value: nil},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		key1FinalTagsToStore := []spi.Tag{{Name: "tagName1_new", Value: "tagValue1_new"}}
-		key2FinalTagsToStore := []spi.Tag{{Name: "tagName2_new", Value: "tagValue2_new"}}
-		key3FinalTagsToStore := []spi.Tag{{Name: "tagName3_new", Value: "tagValue3_new"}}
-
-		operations = []spi.Operation{
-			{Key: "key1", Value: []byte("value1_new"), Tags: key1FinalTagsToStore},
-			{Key: "key2", Value: []byte("value2_new"), Tags: key2FinalTagsToStore},
-			{Key: "key3", Value: []byte("value3_new"), Tags: key3FinalTagsToStore},
-		}
-
-		err = store.Batch(operations)
-		require.NoError(t, err)
-
-		// Check and make sure the new values were stored
-
-		value, err := store.Get("key1")
-		require.NoError(t, err)
-		require.Equal(t, "value1_new", string(value))
-		retrievedTags, err := store.GetTags("key1")
-		require.True(t, equalTags(key1FinalTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-
-		value, err = store.Get("key2")
-		require.NoError(t, err)
-		require.Equal(t, "value2_new", string(value))
-		retrievedTags, err = store.GetTags("key2")
-		require.True(t, equalTags(key2FinalTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-
-		value, err = store.Get("key3")
-		require.NoError(t, err)
-		require.Equal(t, "value3_new", string(value))
-		retrievedTags, err = store.GetTags("key3")
-		require.True(t, equalTags(key3FinalTagsToStore, retrievedTags), "Got unexpected tags")
-		require.NoError(t, err)
-	})
-	t.Run("Failure: Operation has an empty key", func(t *testing.T) {
-		store, err := provider.OpenStore(randomStoreName())
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		operations := []spi.Operation{
-			{Key: "key1", Value: []byte("value1"), Tags: []spi.Tag{{Name: "tagName1", Value: "tagValue1"}}},
-			{Key: "", Value: []byte("value2"), Tags: []spi.Tag{{Name: "tagName2", Value: "tagValue2"}}},
-		}
-
-		err = store.Batch(operations)
-		require.Error(t, err)
-	})
-}
-
-// TestStoreFlush tests common Store Flush functionality.
-func TestStoreFlush(t *testing.T, provider spi.Provider) {
-	t.Run("Success", func(t *testing.T) {
-		store, err := provider.OpenStore(randomStoreName())
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = store.Put("key1", []byte("value1"))
-		require.NoError(t, err)
-
-		err = store.Put("key2", []byte("value2"))
-		require.NoError(t, err)
-
-		err = store.Flush()
-		require.NoError(t, err)
-
-		values, err := store.GetBulk("key1", "key2")
-		require.NoError(t, err)
-		require.Len(t, values, 2)
-		require.Equal(t, "value1", string(values[0]))
-		require.Equal(t, "value2", string(values[1]))
-	})
-}
-
-// TestStoreClose tests common Store Close functionality.
-func TestStoreClose(t *testing.T, provider spi.Provider) {
-	t.Run("Successfully close store", func(t *testing.T) {
-		store, err := provider.OpenStore(randomStoreName())
-		require.NoError(t, err)
-		require.NotNil(t, store)
-
-		err = store.Close()
-		require.NoError(t, err)
-	})
-}
-
-func doPutThenGetTest(t *testing.T, provider spi.Provider, key string, value []byte) {
-	store, err := provider.OpenStore(randomStoreName())
-	require.NoError(t, err)
-
-	err = store.Put(key, value)
-	require.NoError(t, err)
-
-	retrievedValue, err := store.Get(key)
-	require.NoError(t, err)
-	require.Equal(t, value, retrievedValue)
-}
-
-func doPutThenUpdateThenGetTest(t *testing.T, provider spi.Provider, key string, value, updatedValue []byte) {
-	store, err := provider.OpenStore(randomStoreName())
-	require.NoError(t, err)
-
-	err = store.Put(key, value)
-	require.NoError(t, err)
-
-	err = store.Put(key, updatedValue)
-	require.NoError(t, err)
-
-	retrievedValue, err := store.Get(key)
-	require.NoError(t, err)
-	require.Equal(t, updatedValue, retrievedValue)
+func determineWhetherToCheckIteratorTotalItemCounts(options testOptions, storeConfigWasSet bool) bool {
+	if options.skipTotalItemTests {
+		return false
+	}
+
+	if options.onlySkipTotalItemTestsThatDoNotSetStoreConfig && !storeConfigWasSet {
+		return false
+	}
+
+	return true
 }
 
 func randomStoreName() string {

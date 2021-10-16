@@ -16,13 +16,14 @@ import (
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/cucumber/godog"
-	"github.com/piprate/json-gold/ld"
+	jsonld "github.com/piprate/json-gold/ld"
 
 	"github.com/hyperledger/aries-framework-go/component/storageutil/mem"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/did"
-	"github.com/hyperledger/aries-framework-go/pkg/doc/jose"
-	jld "github.com/hyperledger/aries-framework-go/pkg/doc/jsonld"
-	"github.com/hyperledger/aries-framework-go/pkg/doc/signature/jsonld"
+	"github.com/hyperledger/aries-framework-go/pkg/doc/jose/jwk"
+	"github.com/hyperledger/aries-framework-go/pkg/doc/jose/jwk/jwksupport"
+	"github.com/hyperledger/aries-framework-go/pkg/doc/ld"
+	jsonldsig "github.com/hyperledger/aries-framework-go/pkg/doc/signature/jsonld"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/signature/signer"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/signature/suite"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/signature/suite/ecdsasecp256k1signature2019"
@@ -32,11 +33,12 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/doc/verifiable"
 	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/kms/localkms"
+	ldstore "github.com/hyperledger/aries-framework-go/pkg/store/ld"
 	bddagent "github.com/hyperledger/aries-framework-go/test/bdd/agent"
 	"github.com/hyperledger/aries-framework-go/test/bdd/pkg/context"
 	bddDIDExchange "github.com/hyperledger/aries-framework-go/test/bdd/pkg/didexchange"
 	"github.com/hyperledger/aries-framework-go/test/bdd/pkg/didresolver"
-	bddjsonld "github.com/hyperledger/aries-framework-go/test/bdd/pkg/jsonld"
+	bddldcontext "github.com/hyperledger/aries-framework-go/test/bdd/pkg/ldcontext"
 )
 
 // SDKSteps is steps for verifiable credentials using client SDK.
@@ -176,7 +178,7 @@ func (s *SDKSteps) getVCWithEcdsaSecp256k1Signature2019LDP(vc *verifiable.Creden
 		SignatureRepresentation: verifiable.SignatureJWS,
 		Created:                 &vc.Issued.Time,
 		VerificationMethod:      pubKeyID,
-	}, jsonld.WithDocumentLoader(loader))
+	}, jsonldsig.WithDocumentLoader(loader))
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +207,7 @@ func (s *SDKSteps) getVCWithJSONWebSignatureLDP(vc *verifiable.Credential, proof
 		SignatureRepresentation: verifiable.SignatureJWS,
 		Created:                 &vc.Issued.Time,
 		VerificationMethod:      pubKeyID,
-	}, jsonld.WithDocumentLoader(loader))
+	}, jsonldsig.WithDocumentLoader(loader))
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +228,7 @@ func (s *SDKSteps) getVCWithEd25519LDP(vc *verifiable.Credential,
 		SignatureRepresentation: verifiable.SignatureJWS,
 		Created:                 &vc.Issued.Time,
 		VerificationMethod:      pubKeyID,
-	}, jsonld.WithDocumentLoader(loader))
+	}, jsonldsig.WithDocumentLoader(loader))
 	if err != nil {
 		return nil, err
 	}
@@ -346,18 +348,18 @@ func (s *SDKSteps) createSecp256k1KeyPair(agent string) error {
 
 	ecdsaPrivKey := btcecPrivKey.ToECDSA()
 
-	jwk, err := jose.JWKFromKey(&ecdsaPrivKey.PublicKey)
+	j, err := jwksupport.JWKFromKey(&ecdsaPrivKey.PublicKey)
 	if err != nil {
 		return err
 	}
 
-	s.bddContext.PublicKeys[agent] = jwk
+	s.bddContext.PublicKeys[agent] = j
 	s.secp256k1PrivKey = ecdsaPrivKey
 
 	return nil
 }
 
-func createJWK(pubKeyBytes []byte, keyType kms.KeyType) (*jose.JWK, error) {
+func createJWK(pubKeyBytes []byte, keyType kms.KeyType) (*jwk.JWK, error) {
 	var pubKey interface{}
 
 	switch keyType {
@@ -374,7 +376,7 @@ func createJWK(pubKeyBytes []byte, keyType kms.KeyType) (*jose.JWK, error) {
 		return nil, errors.New("unsupported key type: " + string(keyType))
 	}
 
-	return jose.JWKFromKey(pubKey)
+	return jwksupport.JWKFromKey(pubKey)
 }
 
 func mapCryptoKeyType(proofType string) kms.KeyType {
@@ -393,7 +395,7 @@ func mapDIDKeyType(proofType string) string {
 	case ldpEd25519Signature2018, jwsProof:
 		return "Ed25519VerificationKey2018"
 	case ldpJSONWebSignatureECP256, ldpJSONWebSignatureEd25519, ldpJSONWebSignatureSecp256k1:
-		return "JwsVerificationKey2020"
+		return "JsonWebKey2020"
 	case ldpEcdsaSecp256k1Signature2019:
 		return "EcdsaSecp256k1VerificationKey2019"
 	default:
@@ -401,9 +403,37 @@ func mapDIDKeyType(proofType string) string {
 	}
 }
 
+type provider struct {
+	ContextStore        ldstore.ContextStore
+	RemoteProviderStore ldstore.RemoteProviderStore
+}
+
+func (p *provider) JSONLDContextStore() ldstore.ContextStore {
+	return p.ContextStore
+}
+
+func (p *provider) JSONLDRemoteProviderStore() ldstore.RemoteProviderStore {
+	return p.RemoteProviderStore
+}
+
 // CreateDocumentLoader creates a JSON-LD document loader with extra JSON-LD test contexts.
-func CreateDocumentLoader() (ld.DocumentLoader, error) {
-	loader, err := jld.NewDocumentLoader(mem.NewProvider(), jld.WithExtraContexts(bddjsonld.Contexts()...))
+func CreateDocumentLoader() (jsonld.DocumentLoader, error) {
+	contextStore, err := ldstore.NewContextStore(mem.NewProvider())
+	if err != nil {
+		return nil, fmt.Errorf("create JSON-LD context store: %w", err)
+	}
+
+	remoteProviderStore, err := ldstore.NewRemoteProviderStore(mem.NewProvider())
+	if err != nil {
+		return nil, fmt.Errorf("create remote provider store: %w", err)
+	}
+
+	p := &provider{
+		ContextStore:        contextStore,
+		RemoteProviderStore: remoteProviderStore,
+	}
+
+	loader, err := ld.NewDocumentLoader(p, ld.WithExtraContexts(bddldcontext.Extra()...))
 	if err != nil {
 		return nil, fmt.Errorf("create document loader: %w", err)
 	}

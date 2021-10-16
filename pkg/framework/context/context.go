@@ -7,12 +7,17 @@ SPDX-License-Identifier: Apache-2.0
 package context
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/btcsuite/btcutil/base58"
-	"github.com/piprate/json-gold/ld"
+	"github.com/cenkalti/backoff/v4"
+	jsonld "github.com/piprate/json-gold/ld"
 
+	"github.com/hyperledger/aries-framework-go/pkg/common/log"
 	"github.com/hyperledger/aries-framework-go/pkg/crypto"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/common/service"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/dispatcher"
@@ -24,12 +29,21 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/secretlock"
 	"github.com/hyperledger/aries-framework-go/pkg/store/did"
+	"github.com/hyperledger/aries-framework-go/pkg/store/ld"
 	"github.com/hyperledger/aries-framework-go/pkg/store/verifiable"
+	"github.com/hyperledger/aries-framework-go/pkg/vdr/fingerprint"
 	"github.com/hyperledger/aries-framework-go/spi/storage"
+)
+
+const (
+	defaultGetDIDsMaxRetries = 3
+	kaIdentifier             = "#"
 )
 
 // package context creates a framework Provider context to add optional (non default) framework services and provides
 // simple accessor methods to those same services.
+
+var logger = log.New("aries-framework/pkg/framework/context")
 
 // Provider supplies the framework configuration to client objects.
 type Provider struct {
@@ -51,11 +65,16 @@ type Provider struct {
 	vdr                        vdrapi.Registry
 	verifiableStore            verifiable.Store
 	didConnectionStore         did.ConnectionStore
-	jsonldDocumentLoader       ld.DocumentLoader
+	contextStore               ld.ContextStore
+	remoteProviderStore        ld.RemoteProviderStore
+	documentLoader             jsonld.DocumentLoader
 	transportReturnRoute       string
 	frameworkID                string
 	keyType                    kms.KeyType
 	keyAgreementType           kms.KeyType
+	mediaTypeProfiles          []string
+	getDIDsMaxRetries          uint64
+	getDIDsBackOffDuration     time.Duration
 }
 
 type inboundHandler struct {
@@ -74,7 +93,10 @@ func (in *inboundHandler) HandleInbound(msg service.DIDCommMsg, ctx service.DIDC
 
 // New instantiates a new context provider.
 func New(opts ...ProviderOption) (*Provider, error) {
-	ctxProvider := Provider{}
+	ctxProvider := Provider{
+		getDIDsMaxRetries:      defaultGetDIDsMaxRetries,
+		getDIDsBackOffDuration: time.Second,
+	}
 
 	for _, opt := range opts {
 		err := opt(&ctxProvider)
@@ -222,20 +244,83 @@ func (p *Provider) InboundMessageHandler() transport.InboundMessageHandler {
 	}
 }
 
+//nolint:nestif,gocognit,funlen,gocyclo
 func (p *Provider) getDIDs(envelope *transport.Envelope) (string, string, error) {
-	myDID, err := p.didConnectionStore.GetDID(base58.Encode(envelope.ToKey))
-	if errors.Is(err, did.ErrNotFound) {
-	} else if err != nil {
-		return "", "", fmt.Errorf("failed to get my did: %w", err)
+	var (
+		myDID    string
+		theirDID string
+		err      error
+	)
+
+	return myDID, theirDID, backoff.Retry(func() error {
+		var notFound bool
+
+		// nolint: gocritic
+		if id := strings.Index(string(envelope.ToKey), kaIdentifier); id > 0 &&
+			strings.Index(string(envelope.ToKey), "\"kid\":\"did:") > 0 {
+			myDID, err = pubKeyToDID(envelope.ToKey)
+			if err != nil {
+				return fmt.Errorf("getMyDID: envelope.ToKey as myDID: %w", err)
+			}
+
+			logger.Debugf("envelope.ToKey as myDID: %v", myDID)
+		} else {
+			myDID, err = p.didConnectionStore.GetDID(base58.Encode(envelope.ToKey))
+			if errors.Is(err, did.ErrNotFound) {
+				notFound = true
+
+				// try did:key
+				// CreateDIDKey below is for Ed25519 keys only, use the more general CreateDIDKeyByCode if other key
+				// types will be used. Currently, did:key is for legacy packers only, so only support Ed25519 keys.
+				didKey, _ := fingerprint.CreateDIDKey(envelope.ToKey)
+				myDID, err = p.didConnectionStore.GetDID(didKey)
+				if err != nil && !errors.Is(err, did.ErrNotFound) {
+					return fmt.Errorf("failed to get my did from didKey: %w", err)
+				}
+			} else if err != nil {
+				return fmt.Errorf("failed to get my did: %w", err)
+			}
+		}
+
+		// nolint: gocritic
+		if id := strings.Index(string(envelope.FromKey), kaIdentifier); id > 0 &&
+			strings.Index(string(envelope.FromKey), "\"kid\":\"did:") > 0 {
+			theirDID, err = pubKeyToDID(envelope.FromKey)
+			if err != nil {
+				return fmt.Errorf("getDIDs: envelope.FromKey as theirDID: %w", err)
+			}
+
+			logger.Debugf("envelope.FromKey as theirDID: %v", theirDID)
+		} else {
+			if envelope.FromKey != nil {
+				theirDID, err = p.didConnectionStore.GetDID(base58.Encode(envelope.FromKey))
+				if notFound && errors.Is(err, did.ErrNotFound) {
+					// try did:key
+					// CreateDIDKey below is for Ed25519 keys only, use the more general CreateDIDKeyByCode if other key
+					// types will be used. Currently, did:key is for legacy packers, so only support Ed25519 keys.
+					didKey, _ := fingerprint.CreateDIDKey(envelope.FromKey)
+					theirDID, err = p.didConnectionStore.GetDID(didKey)
+					if err != nil && !errors.Is(err, did.ErrNotFound) {
+						return fmt.Errorf("failed to get their did from didKey: %w", err)
+					}
+				} else if err != nil {
+					return fmt.Errorf("failed to get their did: %w", err)
+				}
+			}
+		}
+		return nil
+	}, backoff.WithMaxRetries(backoff.NewConstantBackOff(p.getDIDsBackOffDuration), p.getDIDsMaxRetries))
+}
+
+func pubKeyToDID(key []byte) (string, error) {
+	toKey := &crypto.PublicKey{}
+
+	err := json.Unmarshal(key, toKey)
+	if err != nil {
+		return "", fmt.Errorf("pubKeyToDID: unmarshal key: %w", err)
 	}
 
-	theirDID, err := p.didConnectionStore.GetDID(base58.Encode(envelope.FromKey))
-	if errors.Is(err, did.ErrNotFound) {
-	} else if err != nil {
-		return "", "", fmt.Errorf("failed to get their did: %w", err)
-	}
-
-	return myDID, theirDID, nil
+	return toKey.KID[:strings.Index(toKey.KID, kaIdentifier)], nil
 }
 
 // InboundDIDCommMessageHandler provides a supplier of inbound handlers with all loaded protocol services.
@@ -283,9 +368,19 @@ func (p *Provider) DIDConnectionStore() did.ConnectionStore {
 	return p.didConnectionStore
 }
 
+// JSONLDContextStore returns a JSON-LD context store.
+func (p *Provider) JSONLDContextStore() ld.ContextStore {
+	return p.contextStore
+}
+
+// JSONLDRemoteProviderStore returns a remote JSON-LD context provider store.
+func (p *Provider) JSONLDRemoteProviderStore() ld.RemoteProviderStore {
+	return p.remoteProviderStore
+}
+
 // JSONLDDocumentLoader returns a JSON-LD document loader.
-func (p *Provider) JSONLDDocumentLoader() ld.DocumentLoader {
-	return p.jsonldDocumentLoader
+func (p *Provider) JSONLDDocumentLoader() jsonld.DocumentLoader {
+	return p.documentLoader
 }
 
 // KeyType returns the default Key type (signing/authentication).
@@ -298,6 +393,11 @@ func (p *Provider) KeyAgreementType() kms.KeyType {
 	return p.keyAgreementType
 }
 
+// MediaTypeProfiles returns the default media types profile.
+func (p *Provider) MediaTypeProfiles() []string {
+	return p.mediaTypeProfiles
+}
+
 // ProviderOption configures the framework.
 type ProviderOption func(opts *Provider) error
 
@@ -305,6 +405,22 @@ type ProviderOption func(opts *Provider) error
 func WithOutboundTransports(transports ...transport.OutboundTransport) ProviderOption {
 	return func(opts *Provider) error {
 		opts.outboundTransports = transports
+		return nil
+	}
+}
+
+// WithGetDIDsMaxRetries sets max retries.
+func WithGetDIDsMaxRetries(retries uint64) ProviderOption {
+	return func(opts *Provider) error {
+		opts.getDIDsMaxRetries = retries
+		return nil
+	}
+}
+
+// WithGetDIDsBackOffDuration sets backoff duration.
+func WithGetDIDsBackOffDuration(duration time.Duration) ProviderOption {
+	return func(opts *Provider) error {
+		opts.getDIDsBackOffDuration = duration
 		return nil
 	}
 }
@@ -459,10 +575,26 @@ func WithDIDConnectionStore(store did.ConnectionStore) ProviderOption {
 	}
 }
 
-// WithJSONLDDocumentLoader injects a JSON-LD document loader into the context.
-func WithJSONLDDocumentLoader(loader ld.DocumentLoader) ProviderOption {
+// WithJSONLDContextStore injects a JSON-LD context store into the context.
+func WithJSONLDContextStore(store ld.ContextStore) ProviderOption {
 	return func(opts *Provider) error {
-		opts.jsonldDocumentLoader = loader
+		opts.contextStore = store
+		return nil
+	}
+}
+
+// WithJSONLDRemoteProviderStore injects a JSON-LD remote provider store into the context.
+func WithJSONLDRemoteProviderStore(store ld.RemoteProviderStore) ProviderOption {
+	return func(opts *Provider) error {
+		opts.remoteProviderStore = store
+		return nil
+	}
+}
+
+// WithJSONLDDocumentLoader injects a JSON-LD document loader into the context.
+func WithJSONLDDocumentLoader(loader jsonld.DocumentLoader) ProviderOption {
+	return func(opts *Provider) error {
+		opts.documentLoader = loader
 		return nil
 	}
 }
@@ -491,5 +623,15 @@ func WithKeyAgreementType(keyAgreementType kms.KeyType) ProviderOption {
 		default:
 			return fmt.Errorf("invalid KeyAgreement key type: %s", keyAgreementType)
 		}
+	}
+}
+
+// WithMediaTypeProfiles injects a media type profile into the context.
+func WithMediaTypeProfiles(mediaTypeProfiles []string) ProviderOption {
+	return func(opts *Provider) error {
+		opts.mediaTypeProfiles = make([]string, len(mediaTypeProfiles))
+		copy(opts.mediaTypeProfiles, mediaTypeProfiles)
+
+		return nil
 	}
 }

@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/piprate/json-gold/ld"
+	jsonld "github.com/piprate/json-gold/ld"
 
 	"github.com/hyperledger/aries-framework-go/pkg/crypto"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/common/service"
@@ -21,13 +21,15 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/packer"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/decorator"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/transport"
-	"github.com/hyperledger/aries-framework-go/pkg/doc/jsonld"
+	"github.com/hyperledger/aries-framework-go/pkg/doc/ld"
+	"github.com/hyperledger/aries-framework-go/pkg/doc/ldcontext/remote"
 	"github.com/hyperledger/aries-framework-go/pkg/framework/aries/api"
 	vdrapi "github.com/hyperledger/aries-framework-go/pkg/framework/aries/api/vdr"
 	"github.com/hyperledger/aries-framework-go/pkg/framework/context"
 	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/secretlock"
 	"github.com/hyperledger/aries-framework-go/pkg/store/did"
+	ldstore "github.com/hyperledger/aries-framework-go/pkg/store/ld"
 	"github.com/hyperledger/aries-framework-go/pkg/store/verifiable"
 	"github.com/hyperledger/aries-framework-go/pkg/vdr"
 	"github.com/hyperledger/aries-framework-go/pkg/vdr/key"
@@ -65,11 +67,15 @@ type Aries struct {
 	vdr                        []vdrapi.VDR
 	verifiableStore            verifiable.Store
 	didConnectionStore         did.ConnectionStore
-	jsonldDocumentLoader       ld.DocumentLoader
+	contextStore               ldstore.ContextStore
+	remoteProviderStore        ldstore.RemoteProviderStore
+	documentLoader             jsonld.DocumentLoader
+	contextProviderURLs        []string
 	transportReturnRoute       string
 	id                         string
 	keyType                    kms.KeyType
 	keyAgreementType           kms.KeyType
+	mediaTypeProfiles          []string
 }
 
 // Option configures the framework.
@@ -287,10 +293,34 @@ func WithDIDConnectionStore(store did.ConnectionStore) Option {
 	}
 }
 
-// WithJSONLDDocumentLoader injects a JSON-LD document loader.
-func WithJSONLDDocumentLoader(loader ld.DocumentLoader) Option {
+// WithJSONLDContextStore injects a JSON-LD context store.
+func WithJSONLDContextStore(store ldstore.ContextStore) Option {
 	return func(opts *Aries) error {
-		opts.jsonldDocumentLoader = loader
+		opts.contextStore = store
+		return nil
+	}
+}
+
+// WithJSONLDRemoteProviderStore injects a JSON-LD remote provider store.
+func WithJSONLDRemoteProviderStore(store ldstore.RemoteProviderStore) Option {
+	return func(opts *Aries) error {
+		opts.remoteProviderStore = store
+		return nil
+	}
+}
+
+// WithJSONLDDocumentLoader injects a JSON-LD document loader.
+func WithJSONLDDocumentLoader(loader jsonld.DocumentLoader) Option {
+	return func(opts *Aries) error {
+		opts.documentLoader = loader
+		return nil
+	}
+}
+
+// WithJSONLDContextProviderURL injects URLs of the remote JSON-LD context providers.
+func WithJSONLDContextProviderURL(url ...string) Option {
+	return func(opts *Aries) error {
+		opts.contextProviderURLs = append(opts.contextProviderURLs, url...)
 		return nil
 	}
 }
@@ -307,6 +337,16 @@ func WithKeyType(keyType kms.KeyType) Option {
 func WithKeyAgreementType(keyAgreementType kms.KeyType) Option {
 	return func(opts *Aries) error {
 		opts.keyAgreementType = keyAgreementType
+		return nil
+	}
+}
+
+// WithMediaTypeProfiles injects a default media types profile.
+func WithMediaTypeProfiles(mediaTypeProfiles []string) Option {
+	return func(opts *Aries) error {
+		opts.mediaTypeProfiles = make([]string, len(mediaTypeProfiles))
+		copy(opts.mediaTypeProfiles, mediaTypeProfiles)
+
 		return nil
 	}
 }
@@ -333,9 +373,12 @@ func (a *Aries) Context() (*context.Provider, error) {
 		context.WithMessageServiceProvider(a.msgSvcProvider),
 		context.WithVerifiableStore(a.verifiableStore),
 		context.WithDIDConnectionStore(a.didConnectionStore),
-		context.WithJSONLDDocumentLoader(a.jsonldDocumentLoader),
+		context.WithJSONLDContextStore(a.contextStore),
+		context.WithJSONLDRemoteProviderStore(a.remoteProviderStore),
+		context.WithJSONLDDocumentLoader(a.documentLoader),
 		context.WithKeyType(a.keyType),
 		context.WithKeyAgreementType(a.keyAgreementType),
+		context.WithMediaTypeProfiles(a.mediaTypeProfiles),
 	)
 }
 
@@ -418,9 +461,18 @@ func createVDR(frameworkOpts *Aries) error {
 		return fmt.Errorf("create new vdr peer failed: %w", err)
 	}
 
+	dst := vdrapi.DIDCommServiceType
+
+	for _, mediaType := range frameworkOpts.mediaTypeProfiles {
+		if mediaType == transport.MediaTypeDIDCommV2Profile || mediaType == transport.MediaTypeAIP2RFC0587Profile {
+			dst = vdrapi.DIDCommV2ServiceType
+			break
+		}
+	}
+
 	opts = append(opts,
 		vdr.WithVDR(p),
-		vdr.WithDefaultServiceType(vdrapi.DIDCommServiceType),
+		vdr.WithDefaultServiceType(dst),
 		vdr.WithDefaultServiceEndpoint(ctx.ServiceEndpoint()),
 	)
 
@@ -460,6 +512,8 @@ func createOutboundDispatcher(frameworkOpts *Aries) error {
 		context.WithVDRegistry(frameworkOpts.vdrRegistry),
 		context.WithStorageProvider(frameworkOpts.storeProvider),
 		context.WithProtocolStateStorageProvider(frameworkOpts.protocolStateStoreProvider),
+		context.WithMediaTypeProfiles(frameworkOpts.mediaTypeProfiles),
+		context.WithKeyAgreementType(frameworkOpts.keyAgreementType),
 	)
 	if err != nil {
 		return fmt.Errorf("context creation failed: %w", err)
@@ -491,17 +545,63 @@ func createDIDConnectionStore(frameworkOpts *Aries) error {
 	return err
 }
 
-func createJSONLDDocumentLoader(frameworkOpts *Aries) error {
-	if frameworkOpts.jsonldDocumentLoader != nil {
+func createJSONLDContextStore(frameworkOpts *Aries) error {
+	if frameworkOpts.contextStore != nil {
 		return nil
 	}
 
-	l, err := jsonld.NewDocumentLoader(frameworkOpts.storeProvider)
+	s, err := ldstore.NewContextStore(frameworkOpts.storeProvider)
+	if err != nil {
+		return fmt.Errorf("failed to init JSON-LD context store: %w", err)
+	}
+
+	frameworkOpts.contextStore = s
+
+	return nil
+}
+
+func createJSONLDRemoteProviderStore(frameworkOpts *Aries) error {
+	if frameworkOpts.remoteProviderStore != nil {
+		return nil
+	}
+
+	s, err := ldstore.NewRemoteProviderStore(frameworkOpts.storeProvider)
+	if err != nil {
+		return fmt.Errorf("failed to init JSON-LD remote provider store: %w", err)
+	}
+
+	frameworkOpts.remoteProviderStore = s
+
+	return nil
+}
+
+func createJSONLDDocumentLoader(frameworkOpts *Aries) error {
+	if frameworkOpts.documentLoader != nil {
+		return nil
+	}
+
+	ctx, err := context.New(
+		context.WithJSONLDContextStore(frameworkOpts.contextStore),
+		context.WithJSONLDRemoteProviderStore(frameworkOpts.remoteProviderStore),
+	)
+	if err != nil {
+		return fmt.Errorf("context creation failed: %w", err)
+	}
+
+	var loaderOpts []ld.DocumentLoaderOpts
+
+	if len(frameworkOpts.contextProviderURLs) > 0 {
+		for _, url := range frameworkOpts.contextProviderURLs {
+			loaderOpts = append(loaderOpts, ld.WithRemoteProvider(remote.NewProvider(url)))
+		}
+	}
+
+	documentLoader, err := ld.NewDocumentLoader(ctx, loaderOpts...)
 	if err != nil {
 		return fmt.Errorf("document loader creation failed: %w", err)
 	}
 
-	frameworkOpts.jsonldDocumentLoader = l
+	frameworkOpts.documentLoader = documentLoader
 
 	return nil
 }
@@ -515,6 +615,9 @@ func startTransports(frameworkOpts *Aries) error {
 		context.WithMessageServiceProvider(frameworkOpts.msgSvcProvider),
 		context.WithMessengerHandler(frameworkOpts.messenger),
 		context.WithDIDConnectionStore(frameworkOpts.didConnectionStore),
+		context.WithKeyType(frameworkOpts.keyType),
+		context.WithKeyAgreementType(frameworkOpts.keyAgreementType),
+		context.WithMediaTypeProfiles(frameworkOpts.mediaTypeProfiles),
 	)
 	if err != nil {
 		return fmt.Errorf("context creation failed: %w", err)
@@ -552,7 +655,10 @@ func loadServices(frameworkOpts *Aries) error {
 		context.WithVerifiableStore(frameworkOpts.verifiableStore),
 		context.WithDIDConnectionStore(frameworkOpts.didConnectionStore),
 		context.WithMessageServiceProvider(frameworkOpts.msgSvcProvider),
-		context.WithJSONLDDocumentLoader(frameworkOpts.jsonldDocumentLoader),
+		context.WithJSONLDDocumentLoader(frameworkOpts.documentLoader),
+		context.WithKeyType(frameworkOpts.keyType),
+		context.WithKeyAgreementType(frameworkOpts.keyAgreementType),
+		context.WithMediaTypeProfiles(frameworkOpts.mediaTypeProfiles),
 	)
 	if err != nil {
 		return fmt.Errorf("create context failed: %w", err)
@@ -580,6 +686,7 @@ func createPackersAndPackager(frameworkOpts *Aries) error {
 		context.WithCrypto(frameworkOpts.crypto),
 		context.WithStorageProvider(frameworkOpts.storeProvider),
 		context.WithKMS(frameworkOpts.kms),
+		context.WithVDRegistry(frameworkOpts.vdrRegistry),
 	)
 	if err != nil {
 		return fmt.Errorf("create packer context failed: %w", err)

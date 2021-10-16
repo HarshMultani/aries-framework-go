@@ -32,6 +32,7 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/framework/aries"
 	"github.com/hyperledger/aries-framework-go/pkg/framework/aries/defaults"
 	"github.com/hyperledger/aries-framework-go/pkg/framework/context"
+	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/vdr/httpbinding"
 	"github.com/hyperledger/aries-framework-go/spi/storage"
 )
@@ -162,6 +163,38 @@ const (
 		"RFC0593-compliant attachment formats. Default is false." +
 		" Alternatively, this can be set with the following environment variable: " + agentAutoExecuteRFC0593EnvKey
 
+	// remote JSON-LD context provider url flag.
+	agentContextProviderFlagName  = "context-provider-url"
+	agentContextProviderEnvKey    = "ARIESD_CONTEXT_PROVIDER_URL"
+	agentContextProviderFlagUsage = "Remote context provider URL to get JSON-LD contexts from." +
+		" This flag can be repeated, allowing setting up multiple context providers." +
+		" Alternatively, this can be set with the following environment variable (in CSV format): " +
+		agentContextProviderEnvKey
+
+	// default verification key type flag.
+	agentKeyTypeFlagName = "key-type"
+	agentKeyTypeEnvKey   = "ARIESD_KEY_TYPE"
+	agentKeyTypeUsage    = "Default key type supported by this agent." +
+		" This flag sets the verification (and for DIDComm V1 encryption as well) key type used for key creation in the agent." + //nolint:lll
+		" Alternatively, this can be set with the following environment variable: " +
+		agentKeyTypeEnvKey
+
+	// default key agreement type flag.
+	agentKeyAgreementTypeFlagName = "key-agreement-type"
+	agentKeyAgreementTypeEnvKey   = "ARIESD_KEY_AGREEMENT_TYPE"
+	agentKeyAgreementTypeUsage    = "Default key agreement type supported by this agent." +
+		" Default encryption (used in DIDComm V2) key type used for key agreement creation in the agent." +
+		" Alternatively, this can be set with the following environment variable: " +
+		agentKeyAgreementTypeEnvKey
+
+	// media type profiles flag.
+	agentMediaTypeProfilesFlagName = "media-type-profiles"
+	agentMediaTypeProfilesEnvKey   = "ARIESD_MEDIA_TYPE_PROFILES"
+	agentMediaTypeProfilesUsage    = "Media Type Profiles supported by this agent." +
+		" This flag can be repeated, allowing setting up multiple profiles." +
+		" Alternatively, this can be set with the following environment variable (in CSV format): " +
+		agentMediaTypeProfilesEnvKey
+
 	httpProtocol      = "http"
 	websocketProtocol = "ws"
 
@@ -172,15 +205,35 @@ const (
 var (
 	errMissingHost = errors.New("host not provided")
 	logger         = log.New("aries-framework/agent-rest")
+
+	//nolint:gochecknoglobals
+	keyTypes = map[string]kms.KeyType{
+		"ed25519":           kms.ED25519Type,
+		"ecdsap256ieee1363": kms.ECDSAP256TypeIEEEP1363,
+		"ecdsap256der":      kms.ECDSAP256TypeDER,
+		"ecdsap384ieee1363": kms.ECDSAP384TypeIEEEP1363,
+		"ecdsap384der":      kms.ECDSAP384TypeDER,
+		"ecdsap521ieee1363": kms.ECDSAP521TypeIEEEP1363,
+		"ecdsap521der":      kms.ECDSAP521TypeDER,
+	}
+
+	//nolint:gochecknoglobals
+	keyAgreementTypes = map[string]kms.KeyType{
+		"x25519kw": kms.X25519ECDHKWType,
+		"p256kw":   kms.NISTP256ECDHKWType,
+		"p384kw":   kms.NISTP384ECDHKWType,
+		"p521kw":   kms.NISTP521ECDHKWType,
+	}
 )
 
 type agentParameters struct {
 	server                                         server
 	host, defaultLabel, transportReturnRoute       string
 	tlsCertFile, tlsKeyFile                        string
-	token                                          string
+	token, keyType, keyAgreementType               string
 	webhookURLs, httpResolvers, outboundTransports []string
 	inboundHostInternals, inboundHostExternals     []string
+	contextProviderURLs, mediaTypeProfiles         []string
 	autoAccept                                     bool
 	msgHandler                                     command.MessageHandler
 	dbParam                                        *dbParam
@@ -303,6 +356,11 @@ func createStartCMD(server server) *cobra.Command { //nolint: funlen,gocyclo,goc
 				return err
 			}
 
+			contextProviderURLs, err := getUserSetVars(cmd, agentContextProviderFlagName, agentContextProviderEnvKey, true)
+			if err != nil {
+				return err
+			}
+
 			autoExecuteRFC0593, err := getAutoExecuteRFC0593(cmd)
 			if err != nil {
 				return err
@@ -314,6 +372,21 @@ func createStartCMD(server server) *cobra.Command { //nolint: funlen,gocyclo,goc
 			}
 
 			tlsKeyFile, err := getUserSetVar(cmd, agentTLSKeyFileFlagName, agentTLSKeyFileEnvKey, true)
+			if err != nil {
+				return err
+			}
+
+			keyType, err := getUserSetVar(cmd, agentKeyTypeFlagName, agentKeyTypeEnvKey, true)
+			if err != nil {
+				return err
+			}
+
+			keyAgreementType, err := getUserSetVar(cmd, agentKeyAgreementTypeFlagName, agentKeyAgreementTypeEnvKey, true)
+			if err != nil {
+				return err
+			}
+
+			mediaTypeProfiles, err := getUserSetVars(cmd, agentMediaTypeProfilesFlagName, agentMediaTypeProfilesEnvKey, true)
 			if err != nil {
 				return err
 			}
@@ -331,9 +404,13 @@ func createStartCMD(server server) *cobra.Command { //nolint: funlen,gocyclo,goc
 				outboundTransports:   outboundTransports,
 				autoAccept:           autoAccept,
 				transportReturnRoute: transportReturnRoute,
+				contextProviderURLs:  contextProviderURLs,
 				tlsCertFile:          tlsCertFile,
 				tlsKeyFile:           tlsKeyFile,
 				autoExecuteRFC0593:   autoExecuteRFC0593,
+				keyType:              keyType,
+				keyAgreementType:     keyAgreementType,
+				mediaTypeProfiles:    mediaTypeProfiles,
 			}
 
 			return startAgent(parameters)
@@ -402,6 +479,7 @@ func getAutoExecuteRFC0593(cmd *cobra.Command) (bool, error) {
 	return strconv.ParseBool(autoExecuteRFC0593Str)
 }
 
+//nolint:funlen
 func createFlags(startCmd *cobra.Command) {
 	// agent host flag
 	startCmd.Flags().StringP(agentHostFlagName, agentHostFlagShorthand, "", agentHostFlagUsage)
@@ -447,6 +525,9 @@ func createFlags(startCmd *cobra.Command) {
 	// transport return route option flag
 	startCmd.Flags().StringP(agentTransportReturnRouteFlagName, "", "", agentTransportReturnRouteFlagUsage)
 
+	// remote JSON-LD context provider url flag
+	startCmd.Flags().StringSliceP(agentContextProviderFlagName, "", []string{}, agentContextProviderFlagUsage)
+
 	startCmd.Flags().StringP(agentAutoExecuteRFC0593FlagName, "", "", agentAutoExecuteRFC0593FlagUsage)
 
 	// tls cert file
@@ -459,6 +540,12 @@ func createFlags(startCmd *cobra.Command) {
 
 	// db timeout
 	startCmd.Flags().StringP(databaseTimeoutFlagName, "", "", databaseTimeoutFlagUsage)
+
+	startCmd.Flags().StringP(agentKeyTypeFlagName, "", "", agentKeyTypeUsage)
+
+	startCmd.Flags().StringP(agentKeyAgreementTypeFlagName, "", "", agentKeyAgreementTypeUsage)
+
+	startCmd.Flags().StringSliceP(agentMediaTypeProfilesFlagName, "", []string{}, agentMediaTypeProfilesUsage)
 }
 
 func getUserSetVar(cmd *cobra.Command, flagName, envKey string, isOptional bool) (string, error) {
@@ -696,6 +783,7 @@ func startAgent(parameters *agentParameters) error {
 	return nil
 }
 
+//nolint:funlen,gocyclo
 func createAriesAgent(parameters *agentParameters) (*context.Provider, error) {
 	var opts []aries.Option
 
@@ -735,6 +823,22 @@ func createAriesAgent(parameters *agentParameters) (*context.Provider, error) {
 
 	opts = append(opts, outboundTransportOpts...)
 	opts = append(opts, aries.WithMessageServiceProvider(parameters.msgHandler))
+
+	if len(parameters.contextProviderURLs) > 0 {
+		opts = append(opts, aries.WithJSONLDContextProviderURL(parameters.contextProviderURLs...))
+	}
+
+	if kt, ok := keyTypes[parameters.keyType]; ok {
+		opts = append(opts, aries.WithKeyType(kt))
+	}
+
+	if kat, ok := keyAgreementTypes[parameters.keyAgreementType]; ok {
+		opts = append(opts, aries.WithKeyAgreementType(kat))
+	}
+
+	if len(parameters.mediaTypeProfiles) > 0 {
+		opts = append(opts, aries.WithMediaTypeProfiles(parameters.mediaTypeProfiles))
+	}
 
 	framework, err := aries.New(opts...)
 	if err != nil {

@@ -9,6 +9,7 @@ package didexchange
 import (
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/common/service"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/decorator"
 	"github.com/hyperledger/aries-framework-go/pkg/didcomm/protocol/mediator"
+	"github.com/hyperledger/aries-framework-go/pkg/didcomm/transport"
 	"github.com/hyperledger/aries-framework-go/pkg/doc/did"
 	vdrapi "github.com/hyperledger/aries-framework-go/pkg/framework/aries/api/vdr"
 	"github.com/hyperledger/aries-framework-go/pkg/kms"
@@ -40,9 +42,11 @@ const (
 	// StateIDCompleted marks the completed phase of the did-exchange protocol.
 	StateIDCompleted = "completed"
 	// StateIDAbandoned marks the abandoned phase of the did-exchange protocol.
-	StateIDAbandoned           = "abandoned"
-	ackStatusOK                = "ok"
-	didCommServiceType         = "did-communication"
+	StateIDAbandoned   = "abandoned"
+	ackStatusOK        = "ok"
+	didCommServiceType = "did-communication"
+	// DIDComm V2 service type ref: https://identity.foundation/didcomm-messaging/spec/#did-document-service-endpoint
+	didCommV2ServiceType       = "DIDCommMessaging"
 	ed25519VerificationKey2018 = "Ed25519VerificationKey2018"
 	bls12381G2Key2020          = "Bls12381G2Key2020"
 	jsonWebKey2020             = "JsonWebKey2020"
@@ -358,14 +362,15 @@ func (ctx *context) createInvitedRequest(destination *service.Destination, label
 	}
 
 	// get did document to use in exchange request
-	myDIDDoc, err := ctx.getMyDIDDoc(getPublicDID(options), getRouterConnections(options))
+	myDIDDoc, err := ctx.getMyDIDDoc(getPublicDID(options), getRouterConnections(options),
+		serviceTypeByMediaProfile(destination.MediaTypeProfiles))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	connRec.MyDID = myDIDDoc.ID
 
-	senderKey, err := recipientKey(myDIDDoc)
+	senderKey, err := recipientKeyAsDIDKey(myDIDDoc)
 	if err != nil {
 		return nil, nil, fmt.Errorf("getting recipient key: %w", err)
 	}
@@ -393,10 +398,38 @@ func (ctx *context) createInvitedRequest(destination *service.Destination, label
 	}, connRec, nil
 }
 
-// nolint:gocyclo
+func serviceTypeByMediaProfile(mediaTypeProfiles []string) string {
+	serviceType := didCommServiceType
+
+	for _, mtp := range mediaTypeProfiles {
+		var breakFor bool
+
+		switch mtp {
+		case transport.MediaTypeDIDCommV2Profile, transport.MediaTypeAIP2RFC0587Profile,
+			transport.MediaTypeV2EncryptedEnvelope, transport.MediaTypeV2EncryptedEnvelopeV1PlaintextPayload,
+			transport.MediaTypeV1EncryptedEnvelope:
+			serviceType = didCommV2ServiceType
+
+			breakFor = true
+		}
+
+		if breakFor {
+			break
+		}
+	}
+
+	return serviceType
+}
+
+// nolint:gocyclo,funlen
 func (ctx *context) handleInboundRequest(request *Request, options *options,
 	connRec *connectionstore.Record) (stateAction, *connectionstore.Record, error) {
 	logger.Debugf("handling request: %+v", request)
+
+	// Interop: aca-py issue https://github.com/hyperledger/aries-cloudagent-python/issues/1048
+	if ctx.doACAPyInterop && !strings.HasPrefix(request.DID, "did") {
+		request.DID = "did:peer:" + request.DID
+	}
 
 	requestDidDoc, err := ctx.resolveDidDocFromMessage(request.DID, request.DocAttach)
 	if err != nil {
@@ -405,15 +438,37 @@ func (ctx *context) handleInboundRequest(request *Request, options *options,
 
 	// get did document that will be used in exchange response
 	// (my did doc)
-	responseDidDoc, err := ctx.getMyDIDDoc(
-		getPublicDID(options), getRouterConnections(options))
+	myDID := getPublicDID(options)
+
+	destination, err := service.CreateDestination(requestDidDoc)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var serviceType string
+	if len(requestDidDoc.Service) > 0 {
+		serviceType = requestDidDoc.Service[0].Type
+	} else {
+		serviceType = serviceTypeByMediaProfile(destination.MediaTypeProfiles)
+	}
+
+	responseDidDoc, err := ctx.getMyDIDDoc(myDID, getRouterConnections(options), serviceType)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get response did doc and connection: %w", err)
 	}
 
-	senderVerKey, err := recipientKey(responseDidDoc)
-	if err != nil {
-		return nil, nil, fmt.Errorf("handle inbound request: %w", err)
+	var senderVerKey string
+
+	if myDID != "" { // empty myDID means a new DID was just created and not exchanged yet, use did:key instead
+		senderVerKey, err = recipientKey(responseDidDoc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("handle inbound request: %w", err)
+		}
+	} else {
+		senderVerKey, err = recipientKeyAsDIDKey(responseDidDoc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("handle inbound request: %w", err)
+		}
 	}
 
 	connRec.MyDID = responseDidDoc.ID
@@ -431,19 +486,8 @@ func (ctx *context) handleInboundRequest(request *Request, options *options,
 		return nil, nil, fmt.Errorf("preparing response: %w", err)
 	}
 
-	// Interop: aca-py issue https://github.com/hyperledger/aries-cloudagent-python/issues/1048
-	if ctx.doACAPyInterop && !strings.HasPrefix(request.DID, "did") {
-		connRec.TheirDID = "did:peer:" + request.DID
-	} else {
-		connRec.TheirDID = request.DID
-	}
-
+	connRec.TheirDID = request.DID
 	connRec.TheirLabel = request.Label
-
-	destination, err := service.CreateDestination(requestDidDoc)
-	if err != nil {
-		return nil, nil, err
-	}
 
 	if len(destination.MediaTypeProfiles) > 0 {
 		connRec.MediaTypeProfiles = destination.MediaTypeProfiles
@@ -503,9 +547,9 @@ func (ctx *context) didDocAttachment(doc *did.Doc, myVerKey string) (*decorator.
 	// Interop: signing did_doc~attach has been removed from the spec, but aca-py still verifies signatures
 	// TODO make aca-py issue
 	if ctx.doACAPyInterop {
-		pubKeyBytes, err := fingerprint.PubKeyFromDIDKey(myVerKey)
+		pubKeyBytes, err := ctx.resolvePublicKey(myVerKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to extract pubKeyBytes from did:key [%s]: %w", myVerKey, err)
+			return nil, fmt.Errorf("failed to resolve public key: %w", err)
 		}
 
 		// TODO: use dynamic context KeyType
@@ -526,6 +570,33 @@ func (ctx *context) didDocAttachment(doc *did.Doc, myVerKey string) (*decorator.
 	}
 
 	return docAttach, nil
+}
+
+func (ctx *context) resolvePublicKey(kid string) ([]byte, error) {
+	if strings.HasPrefix(kid, "did:key:") {
+		pubKeyBytes, err := fingerprint.PubKeyFromDIDKey(kid)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract pubKeyBytes from did:key [%s]: %w", kid, err)
+		}
+
+		return pubKeyBytes, nil
+	} else if strings.HasPrefix(kid, "did:") {
+		vkDID := strings.Split(kid, "#")[0]
+
+		pubDoc, err := ctx.vdRegistry.Resolve(vkDID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve public did for key ID '%s': %w", kid, err)
+		}
+
+		vm, ok := did.LookupPublicKey(kid, pubDoc.DIDDocument)
+		if !ok {
+			return nil, fmt.Errorf("failed to lookup public key for ID %s", kid)
+		}
+
+		return vm.Value, nil
+	}
+
+	return nil, fmt.Errorf("failed to resolve public key value from kid '%s'", kid)
 }
 
 func getPublicDID(options *options) string {
@@ -559,14 +630,15 @@ func (ctx *context) getDestination(invitation *Invitation) (*service.Destination
 	}
 
 	return &service.Destination{
-		RecipientKeys:   invitation.RecipientKeys,
-		ServiceEndpoint: invitation.ServiceEndpoint,
-		RoutingKeys:     invitation.RoutingKeys,
+		RecipientKeys:     invitation.RecipientKeys,
+		ServiceEndpoint:   invitation.ServiceEndpoint,
+		RoutingKeys:       invitation.RoutingKeys,
+		MediaTypeProfiles: ctx.mediaTypeProfiles,
 	}, nil
 }
 
 // nolint:gocyclo,funlen
-func (ctx *context) getMyDIDDoc(pubDID string, routerConnections []string) (*did.Doc, error) {
+func (ctx *context) getMyDIDDoc(pubDID string, routerConnections []string, serviceType string) (*did.Doc, error) {
 	if pubDID != "" {
 		logger.Debugf("using public did[%s] for connection", pubDID)
 
@@ -585,7 +657,10 @@ func (ctx *context) getMyDIDDoc(pubDID string, routerConnections []string) (*did
 
 	logger.Debugf("creating new '%s' did for connection", didMethod)
 
-	var services []did.Service
+	var (
+		services   []did.Service
+		newService bool
+	)
 
 	for _, connID := range routerConnections {
 		// get the route configs (pass empty service endpoint, as default service endpoint added in VDR)
@@ -598,14 +673,32 @@ func (ctx *context) getMyDIDDoc(pubDID string, routerConnections []string) (*did
 	}
 
 	if len(services) == 0 {
-		services = append(services, did.Service{})
+		newService = true
+
+		services = append(services, did.Service{Type: serviceType})
 	}
 
 	newDID := &did.Doc{Service: services}
 
-	err := createNewKeyAndVM(newDID, ctx.keyType, ctx.keyAgreementType, ctx.kms)
+	err := ctx.createNewKeyAndVM(newDID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create and export public key: %w", err)
+	}
+
+	if newService {
+		switch newDID.Service[0].Type {
+		case didCommServiceType, "IndyAgent":
+			recKey, _ := fingerprint.CreateDIDKey(newDID.VerificationMethod[0].Value)
+			newDID.Service[0].RecipientKeys = []string{recKey}
+		case didCommV2ServiceType:
+			var recKeys []string
+
+			for _, r := range newDID.KeyAgreement {
+				recKeys = append(recKeys, r.VerificationMethod.ID)
+			}
+
+			newDID.Service[0].RecipientKeys = recKeys
+		}
 	}
 
 	// by default use peer did
@@ -615,17 +708,9 @@ func (ctx *context) getMyDIDDoc(pubDID string, routerConnections []string) (*did
 	}
 
 	if len(routerConnections) != 0 {
-		svc, ok := did.LookupService(docResolution.DIDDocument, didCommServiceType)
-		if ok {
-			for _, recKey := range svc.RecipientKeys {
-				for _, connID := range routerConnections {
-					// TODO https://github.com/hyperledger/aries-framework-go/issues/1105 Support to Add multiple
-					//  recKeys to the Router
-					if err = mediator.AddKeyToRouter(ctx.routeSvc, connID, recKey); err != nil {
-						return nil, fmt.Errorf("did doc - add key to the router: %w", err)
-					}
-				}
-			}
+		err = ctx.addRouterKeys(docResolution.DIDDocument, routerConnections)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -635,6 +720,46 @@ func (ctx *context) getMyDIDDoc(pubDID string, routerConnections []string) (*did
 	}
 
 	return docResolution.DIDDocument, nil
+}
+
+func (ctx *context) addRouterKeys(doc *did.Doc, routerConnections []string) error {
+	// try DIDComm V2 and use it if found, else use default DIDComm v1 bloc.
+	_, ok := did.LookupService(doc, didCommV2ServiceType)
+	if ok {
+		// use KeyAgreement.ID as recKey for DIDComm V2
+		for _, ka := range doc.KeyAgreement {
+			for _, connID := range routerConnections {
+				// TODO https://github.com/hyperledger/aries-framework-go/issues/1105 Support to Add multiple
+				//  recKeys to the Router. (DIDComm V2 uses list of keyAgreements as router keys here, double check
+				//  if this issue can be closed).
+				kaID := ka.VerificationMethod.ID
+				if strings.HasPrefix(kaID, "#") {
+					kaID = doc.ID + kaID
+				}
+
+				if err := mediator.AddKeyToRouter(ctx.routeSvc, connID, kaID); err != nil {
+					return fmt.Errorf("did doc - add key to the router: %w", err)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	svc, ok := did.LookupService(doc, didCommServiceType)
+	if ok {
+		for _, recKey := range svc.RecipientKeys {
+			for _, connID := range routerConnections {
+				// TODO https://github.com/hyperledger/aries-framework-go/issues/1105 Support to Add multiple
+				//  recKeys to the Router
+				if err := mediator.AddKeyToRouter(ctx.routeSvc, connID, recKey); err != nil {
+					return fmt.Errorf("did doc - add key to the router: %w", err)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (ctx *context) isPrivateDIDMethod(method string) bool {
@@ -690,6 +815,11 @@ func (ctx *context) resolveDidDocFromMessage(didValue string, attachment *decora
 		method = "peer"
 	}
 
+	// Interop: part of above issue https://github.com/hyperledger/aries-cloudagent-python/issues/1048
+	if ctx.doACAPyInterop {
+		didDoc.ID = didValue
+	}
+
 	// store provided did document
 	_, err = ctx.vdRegistry.Create(method, didDoc, vdrapi.WithOption("store", true))
 	if err != nil {
@@ -712,10 +842,10 @@ func (ctx *context) handleInboundResponse(response *Response) (stateAction, *con
 
 	// Interop: aca-py issue https://github.com/hyperledger/aries-cloudagent-python/issues/1048
 	if ctx.doACAPyInterop && !strings.HasPrefix(response.DID, "did") {
-		connRecord.TheirDID = "did:peer:" + response.DID
-	} else {
-		connRecord.TheirDID = response.DID
+		response.DID = "did:peer:" + response.DID
 	}
+
+	connRecord.TheirDID = response.DID
 
 	responseDidDoc, err := ctx.resolveDidDocFromMessage(response.DID, response.DocAttach)
 	if err != nil {
@@ -823,7 +953,7 @@ func (ctx *context) getVerKeyFromOOBInvitation(invitationID string) (string, err
 	return pubKey, nil
 }
 
-// nolint:gocyclo
+// nolint:gocyclo,funlen
 func (ctx *context) getServiceBlock(i *OOBInvitation) (*did.Service, error) {
 	logger.Debugf("extracting service block from oobinvitation=%+v", i)
 
@@ -836,7 +966,16 @@ func (ctx *context) getServiceBlock(i *OOBInvitation) (*did.Service, error) {
 			return nil, fmt.Errorf("failed to resolve service=%s : %w", svc, err)
 		}
 
-		s, found := did.LookupService(docResolution.DIDDocument, didCommServiceType)
+		s, found := did.LookupService(docResolution.DIDDocument, didCommV2ServiceType)
+		if found {
+			// s.recipientKeys are keyAgreement[].VerificationMethod.ID for didComm V2. They are not officially part of
+			// the service bloc.
+			block = s
+
+			break
+		}
+
+		s, found = did.LookupService(docResolution.DIDDocument, didCommServiceType)
 		if !found {
 			if ctx.doACAPyInterop {
 				s, err = interopSovService(docResolution.DIDDocument)
@@ -872,6 +1011,20 @@ func (ctx *context) getServiceBlock(i *OOBInvitation) (*did.Service, error) {
 	}
 
 	if len(i.MediaTypeProfiles) > 0 {
+		// marshal/unmarshal to "clone" service block
+		blockBytes, err := json.Marshal(block)
+		if err != nil {
+			return nil, fmt.Errorf("service block marhsal error: %w", err)
+		}
+
+		block = &did.Service{}
+
+		err = json.Unmarshal(blockBytes, block)
+		if err != nil {
+			return nil, fmt.Errorf("service block unmarhsal error: %w", err)
+		}
+
+		// updating Accept header requires a cloned service block to avoid Data Race errors.
 		// RFC0587: In case the accept property is set in both the DID service block and the out-of-band message,
 		// the out-of-band property takes precedence.
 		block.Accept = i.MediaTypeProfiles
@@ -910,6 +1063,7 @@ func (ctx *context) resolveVerKey(i *OOBInvitation) (string, error) {
 
 	logger.Debugf("extracted verkey=%s", svc.RecipientKeys[0])
 
+	// use RecipientKeys[0] (DIDComm V1)
 	return svc.RecipientKeys[0], nil
 }
 
@@ -926,4 +1080,35 @@ func recipientKey(doc *did.Doc) (string, error) {
 	}
 
 	return dest.RecipientKeys[0], nil
+}
+
+func recipientKeyAsDIDKey(doc *did.Doc) (string, error) {
+	var (
+		key string
+		err error
+	)
+
+	switch doc.Service[0].Type {
+	case vdrapi.DIDCommServiceType:
+		return recipientKey(doc)
+	case vdrapi.DIDCommV2ServiceType:
+		// DIDComm V2 recipientKeys are KeyAgreement.ID, convert corresponding verification material to did:key since
+		// recipient doesn't have the DID 'doc' yet.
+		switch doc.KeyAgreement[0].VerificationMethod.Type {
+		case x25519KeyAgreementKey2019:
+			key, _ = fingerprint.CreateDIDKeyByCode(fingerprint.X25519PubKeyMultiCodec,
+				doc.KeyAgreement[0].VerificationMethod.Value)
+		case jsonWebKey2020:
+			key, _, err = fingerprint.CreateDIDKeyByJwk(doc.KeyAgreement[0].VerificationMethod.JSONWebKey())
+			if err != nil {
+				return "", fmt.Errorf("recipientKeyAsDIDKey: unable to create did:key from JWK: %w", err)
+			}
+		default:
+			return "", fmt.Errorf("keyAgreement type '%v' not supported", doc.KeyAgreement[0].VerificationMethod.Type)
+		}
+
+		return key, nil
+	default:
+		return interopRecipientKey(doc)
+	}
 }

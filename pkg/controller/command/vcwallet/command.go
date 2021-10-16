@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/piprate/json-gold/ld"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/hyperledger/aries-framework-go/pkg/crypto"
 	"github.com/hyperledger/aries-framework-go/pkg/framework/aries/api/vdr"
 	"github.com/hyperledger/aries-framework-go/pkg/internal/logutil"
+	"github.com/hyperledger/aries-framework-go/pkg/kms"
 	"github.com/hyperledger/aries-framework-go/pkg/kms/webkms"
 	"github.com/hyperledger/aries-framework-go/pkg/wallet"
 	"github.com/hyperledger/aries-framework-go/spi/storage"
@@ -75,6 +77,18 @@ const (
 
 	// CreateKeyPairFromWalletErrorCode for errors while creating key pair from wallet.
 	CreateKeyPairFromWalletErrorCode
+
+	// ProfileExistsErrorCode for errors while checking if profile exists for a wallet user.
+	ProfileExistsErrorCode
+
+	// DIDConnectErrorCode for errors while performing DID connect in wallet.
+	DIDConnectErrorCode
+
+	// ProposePresentationErrorCode for errors while proposing presentation.
+	ProposePresentationErrorCode
+
+	// PresentProofErrorCode for errors while presenting proof from wallet.
+	PresentProofErrorCode
 )
 
 // All command operations.
@@ -82,30 +96,46 @@ const (
 	CommandName = "vcwallet"
 
 	// command methods.
-	CreateProfileMethod = "CreateProfile"
-	UpdateProfileMethod = "UpdateProfile"
-	OpenMethod          = "Open"
-	CloseMethod         = "Close"
-	AddMethod           = "Add"
-	RemoveMethod        = "Remove"
-	GetMethod           = "Get"
-	GetAllMethod        = "GetAll"
-	QueryMethod         = "Query"
-	IssueMethod         = "Issue"
-	ProveMethod         = "Prove"
-	VerifyMethod        = "Verify"
-	DeriveMethod        = "Derive"
-	CreateKeyPairMethod = "CreateKeyPair"
+	CreateProfileMethod       = "CreateProfile"
+	UpdateProfileMethod       = "UpdateProfile"
+	ProfileExistsMethod       = "ProfileExists"
+	OpenMethod                = "Open"
+	CloseMethod               = "Close"
+	AddMethod                 = "Add"
+	RemoveMethod              = "Remove"
+	GetMethod                 = "Get"
+	GetAllMethod              = "GetAll"
+	QueryMethod               = "Query"
+	IssueMethod               = "Issue"
+	ProveMethod               = "Prove"
+	VerifyMethod              = "Verify"
+	DeriveMethod              = "Derive"
+	CreateKeyPairMethod       = "CreateKeyPair"
+	ConnectMethod             = "Connect"
+	ProposePresentationMethod = "ProposePresentation"
+	PresentProofMethod        = "PresentProof"
 )
 
 // miscellaneous constants for the vc wallet command controller.
 const (
 	// log constants.
-	logSuccess   = "success"
-	logUserIDKey = "userID"
+	logSuccess         = "success"
+	logUserIDKey       = "userID"
+	connectionIDString = "connectionID"
+	invitationIDString = "invitationID"
+	LabelString        = "label"
 
 	emptyRawLength = 4
+
+	defaultTokenExpiry = 5 * time.Minute
 )
+
+// AuthCapabilityProvider is for providing Authorization Capabilities (ZCAP-LD) feature for
+// wallet's EDV and WebKMS components.
+type AuthCapabilityProvider interface {
+	// Returns HTTP Header Signer.
+	GetHeaderSigner(authzKeyStoreURL, accessToken, secretShare string) HTTPHeaderSigner
+}
 
 // HTTPHeaderSigner is for http header signing, typically used for zcapld functionality.
 type HTTPHeaderSigner interface {
@@ -117,9 +147,9 @@ type HTTPHeaderSigner interface {
 // All properties of this config are optional, but they can be used to customize wallet's webkms and edv client's.
 type Config struct {
 	// EDV header signer, typically used for introducing zcapld feature.
-	EdvAuthSigner HTTPHeaderSigner
+	EdvAuthzProvider AuthCapabilityProvider
 	// Web KMS header signer, typically used for introducing zcapld feature.
-	WebKMSAuthSigner HTTPHeaderSigner
+	WebKMSAuthzProvider AuthCapabilityProvider
 	// option is a performance optimization that speeds up queries by getting full documents from
 	// the EDV server instead of only document locations.
 	EDVReturnFullDocumentsOnQuery bool
@@ -127,6 +157,9 @@ type Config struct {
 	EDVBatchEndpointExtensionEnabled bool
 	// Aries Web KMS cache size configuration.
 	WebKMSCacheSize int
+	// Default token expiry for all wallet profiles created.
+	// Will be used only if wallet unlock request doesn't supply default timeout value.
+	DefaultTokenExpiry time.Duration
 }
 
 // provider contains dependencies for the verifiable credential wallet command controller
@@ -136,6 +169,20 @@ type provider interface {
 	VDRegistry() vdr.Registry
 	Crypto() crypto.Crypto
 	JSONLDDocumentLoader() ld.DocumentLoader
+	MediaTypeProfiles() []string
+	didCommProvider // to be used only if wallet needs to be participated in DIDComm.
+}
+
+// didCommProvider to be used only if wallet needs to be participated in DIDComm operation.
+// TODO: using wallet KMS instead of provider KMS.
+// TODO: reconcile Protocol storage with wallet store.
+type didCommProvider interface {
+	KMS() kms.KeyManager
+	ServiceEndpoint() string
+	ProtocolStateStorageProvider() storage.Provider
+	Service(id string) (interface{}, error)
+	KeyType() kms.KeyType
+	KeyAgreementType() kms.KeyType
 }
 
 // Command contains operations provided by verifiable credential wallet controller.
@@ -152,6 +199,10 @@ func New(p provider, config *Config) *Command {
 		cmd.config = config
 	}
 
+	if cmd.config.DefaultTokenExpiry == 0 {
+		cmd.config.DefaultTokenExpiry = defaultTokenExpiry
+	}
+
 	return cmd
 }
 
@@ -160,6 +211,7 @@ func (o *Command) GetHandlers() []command.Handler {
 	return []command.Handler{
 		cmdutil.NewCommandHandler(CommandName, CreateProfileMethod, o.CreateProfile),
 		cmdutil.NewCommandHandler(CommandName, UpdateProfileMethod, o.UpdateProfile),
+		cmdutil.NewCommandHandler(CommandName, ProfileExistsMethod, o.ProfileExists),
 		cmdutil.NewCommandHandler(CommandName, OpenMethod, o.Open),
 		cmdutil.NewCommandHandler(CommandName, CloseMethod, o.Close),
 		cmdutil.NewCommandHandler(CommandName, AddMethod, o.Add),
@@ -172,6 +224,9 @@ func (o *Command) GetHandlers() []command.Handler {
 		cmdutil.NewCommandHandler(CommandName, VerifyMethod, o.Verify),
 		cmdutil.NewCommandHandler(CommandName, DeriveMethod, o.Derive),
 		cmdutil.NewCommandHandler(CommandName, CreateKeyPairMethod, o.CreateKeyPair),
+		cmdutil.NewCommandHandler(CommandName, ConnectMethod, o.Connect),
+		cmdutil.NewCommandHandler(CommandName, ProposePresentationMethod, o.ProposePresentation),
+		cmdutil.NewCommandHandler(CommandName, PresentProofMethod, o.PresentProof),
 	}
 }
 
@@ -235,11 +290,42 @@ func (o *Command) UpdateProfile(rw io.Writer, req io.Reader) command.Error {
 	return nil
 }
 
+// ProfileExists checks if wallet profile exists for given wallet user.
+func (o *Command) ProfileExists(rw io.Writer, req io.Reader) command.Error {
+	user := &WalletUser{}
+
+	err := json.NewDecoder(req).Decode(&user)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ProfileExistsMethod, err.Error())
+
+		return command.NewValidationError(InvalidRequestErrorCode, err)
+	}
+
+	err = wallet.ProfileExists(user.ID, o.ctx)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ProfileExistsMethod, err.Error())
+
+		return command.NewExecuteError(ProfileExistsErrorCode, err)
+	}
+
+	logutil.LogDebug(logger, CommandName, ProfileExistsMethod, logSuccess,
+		logutil.CreateKeyValueString(logUserIDKey, user.ID))
+
+	return nil
+}
+
 // Open unlocks given user's wallet and returns a token for subsequent use of wallet features.
 func (o *Command) Open(rw io.Writer, req io.Reader) command.Error {
 	request := &UnlockWalletRequest{}
 
 	err := json.NewDecoder(req).Decode(&request)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, OpenMethod, err.Error())
+
+		return command.NewValidationError(InvalidRequestErrorCode, err)
+	}
+
+	opts, err := prepareUnlockOptions(request, o.config)
 	if err != nil {
 		logutil.LogInfo(logger, CommandName, OpenMethod, err.Error())
 
@@ -253,7 +339,7 @@ func (o *Command) Open(rw io.Writer, req io.Reader) command.Error {
 		return command.NewExecuteError(OpenWalletErrorCode, err)
 	}
 
-	token, err := vcWallet.Open(prepareUnlockOptions(request, o.config)...)
+	token, err := vcWallet.Open(opts...)
 	if err != nil {
 		logutil.LogInfo(logger, CommandName, OpenMethod, err.Error())
 
@@ -632,6 +718,125 @@ func (o *Command) CreateKeyPair(rw io.Writer, req io.Reader) command.Error {
 	return nil
 }
 
+// Connect accepts out-of-band invitations and performs DID exchange.
+func (o *Command) Connect(rw io.Writer, req io.Reader) command.Error {
+	request := &ConnectRequest{}
+
+	err := json.NewDecoder(req).Decode(&request)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ConnectMethod, err.Error())
+
+		return command.NewValidationError(InvalidRequestErrorCode, err)
+	}
+
+	vcWallet, err := wallet.New(request.UserID, o.ctx)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ConnectMethod, err.Error())
+
+		return command.NewExecuteError(DIDConnectErrorCode, err)
+	}
+
+	connectionID, err := vcWallet.Connect(request.Auth, request.Invitation,
+		wallet.WithConnectTimeout(request.Timeout), wallet.WithReuseDID(request.ReuseConnection),
+		wallet.WithReuseAnyConnection(request.ReuseAnyConnection), wallet.WithMyLabel(request.MyLabel),
+		wallet.WithRouterConnections(request.RouterConnections...))
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ConnectMethod, err.Error())
+
+		return command.NewExecuteError(DIDConnectErrorCode, err)
+	}
+
+	command.WriteNillableResponse(rw, &ConnectResponse{ConnectionID: connectionID}, logger)
+
+	logutil.LogDebug(logger, CommandName, ConnectMethod, logSuccess,
+		logutil.CreateKeyValueString(logUserIDKey, request.UserID),
+		logutil.CreateKeyValueString(invitationIDString, request.Invitation.ID),
+		logutil.CreateKeyValueString(LabelString, request.MyLabel),
+		logutil.CreateKeyValueString(connectionIDString, connectionID))
+
+	return nil
+}
+
+// ProposePresentation accepts out-of-band invitation and sends message proposing presentation
+// from wallet to relying party.
+// https://w3c-ccg.github.io/universal-wallet-interop-spec/#proposepresentation
+//
+// Currently Supporting
+// [0454-present-proof-v2](https://github.com/hyperledger/aries-rfcs/tree/master/features/0454-present-proof-v2)
+func (o *Command) ProposePresentation(rw io.Writer, req io.Reader) command.Error {
+	request := &ProposePresentationRequest{}
+
+	err := json.NewDecoder(req).Decode(&request)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ProposePresentationMethod, err.Error())
+
+		return command.NewValidationError(InvalidRequestErrorCode, err)
+	}
+
+	vcWallet, err := wallet.New(request.UserID, o.ctx)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ProposePresentationMethod, err.Error())
+
+		return command.NewExecuteError(ProposePresentationErrorCode, err)
+	}
+
+	msg, err := vcWallet.ProposePresentation(request.Auth, request.Invitation,
+		wallet.WithFromDID(request.FromDID), wallet.WithPresentProofTimeout(request.Timeout),
+		wallet.WithConnectOptions(wallet.WithConnectTimeout(request.ConnectionOpts.Timeout),
+			wallet.WithReuseDID(request.ConnectionOpts.ReuseConnection),
+			wallet.WithReuseAnyConnection(request.ConnectionOpts.ReuseAnyConnection),
+			wallet.WithMyLabel(request.ConnectionOpts.MyLabel),
+			wallet.WithRouterConnections(request.ConnectionOpts.RouterConnections...)))
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, ProposePresentationMethod, err.Error())
+
+		return command.NewExecuteError(ProposePresentationErrorCode, err)
+	}
+
+	command.WriteNillableResponse(rw, &ProposePresentationResponse{PresentationRequest: msg}, logger)
+
+	logutil.LogDebug(logger, CommandName, ProposePresentationMethod, logSuccess,
+		logutil.CreateKeyValueString(logUserIDKey, request.UserID))
+
+	return nil
+}
+
+// PresentProof sends present proof message from wallet to relying party.
+// https://w3c-ccg.github.io/universal-wallet-interop-spec/#presentproof
+//
+// Currently Supporting
+// [0454-present-proof-v2](https://github.com/hyperledger/aries-rfcs/tree/master/features/0454-present-proof-v2)
+//
+func (o *Command) PresentProof(rw io.Writer, req io.Reader) command.Error {
+	request := &PresentProofRequest{}
+
+	err := json.NewDecoder(req).Decode(&request)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, PresentProofMethod, err.Error())
+
+		return command.NewValidationError(InvalidRequestErrorCode, err)
+	}
+
+	vcWallet, err := wallet.New(request.UserID, o.ctx)
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, PresentProofMethod, err.Error())
+
+		return command.NewExecuteError(PresentProofErrorCode, err)
+	}
+
+	err = vcWallet.PresentProof(request.Auth, request.ThreadID, wallet.FromRawPresentation(request.Presentation))
+	if err != nil {
+		logutil.LogInfo(logger, CommandName, PresentProofMethod, err.Error())
+
+		return command.NewExecuteError(PresentProofErrorCode, err)
+	}
+
+	logutil.LogDebug(logger, CommandName, PresentProofMethod, logSuccess,
+		logutil.CreateKeyValueString(logUserIDKey, request.UserID))
+
+	return nil
+}
+
 // prepareProfileOptions prepares options for creating wallet profile.
 func prepareProfileOptions(rqst *CreateOrUpdateProfileRequest) []wallet.ProfileOptions {
 	var options []wallet.ProfileOptions
@@ -655,7 +860,8 @@ func prepareProfileOptions(rqst *CreateOrUpdateProfileRequest) []wallet.ProfileO
 }
 
 // prepareUnlockOptions prepares options for unlocking wallet.
-func prepareUnlockOptions(rqst *UnlockWalletRequest, conf *Config) []wallet.UnlockOptions { // nolint:funlen,gocyclo
+//nolint: lll
+func prepareUnlockOptions(rqst *UnlockWalletRequest, conf *Config) ([]wallet.UnlockOptions, error) { // nolint:funlen,gocyclo
 	var options []wallet.UnlockOptions
 
 	if rqst.LocalKMSPassphrase != "" {
@@ -665,21 +871,28 @@ func prepareUnlockOptions(rqst *UnlockWalletRequest, conf *Config) []wallet.Unlo
 	var webkmsOpts []webkms.Opt
 
 	if rqst.WebKMSAuth != nil {
-		if rqst.WebKMSAuth.AuthToken != "" {
-			webkmsOpts = append(webkmsOpts, webkms.WithHeaders(
-				func(req *http.Request) (*http.Header, error) {
-					req.Header.Set("authorization", fmt.Sprintf("Bearer %s", rqst.EDVUnlock.AuthToken))
+		var webKMSHeader func(*http.Request) (*http.Header, error)
 
-					return &req.Header, nil
-				},
-			))
-		} else if rqst.WebKMSAuth.Capability != "" && conf.WebKMSAuthSigner != nil {
-			webkmsOpts = append(webkmsOpts, webkms.WithHeaders(
-				func(req *http.Request) (*http.Header, error) {
-					return conf.EdvAuthSigner.SignHeader(req, []byte(rqst.WebKMSAuth.Capability))
-				},
-			))
+		if rqst.WebKMSAuth.Capability != "" { // zcap ld signing
+			if conf.WebKMSAuthzProvider == nil {
+				return nil, fmt.Errorf("authorization capability for WebKMS is not configured")
+			}
+
+			signer := conf.WebKMSAuthzProvider.GetHeaderSigner(rqst.WebKMSAuth.AuthZKeyStoreURL,
+				rqst.WebKMSAuth.AuthToken, rqst.WebKMSAuth.SecretShare)
+
+			webKMSHeader = func(req *http.Request) (*http.Header, error) {
+				return signer.SignHeader(req, []byte(rqst.WebKMSAuth.Capability))
+			}
+		} else if rqst.WebKMSAuth.AuthToken != "" { // auth token
+			webKMSHeader = func(req *http.Request) (*http.Header, error) {
+				req.Header.Set("authorization", fmt.Sprintf("Bearer %s", rqst.EDVUnlock.AuthToken))
+
+				return &req.Header, nil
+			}
 		}
+
+		webkmsOpts = append(webkmsOpts, webkms.WithHeaders(webKMSHeader))
 	}
 
 	if conf.WebKMSCacheSize > 0 {
@@ -689,21 +902,28 @@ func prepareUnlockOptions(rqst *UnlockWalletRequest, conf *Config) []wallet.Unlo
 	var edvOpts []edv.RESTProviderOption
 
 	if rqst.EDVUnlock != nil {
-		if rqst.EDVUnlock.AuthToken != "" {
-			edvOpts = append(edvOpts, edv.WithHeaders(
-				func(req *http.Request) (*http.Header, error) {
-					req.Header.Set("authorization", fmt.Sprintf("Bearer %s", rqst.EDVUnlock.AuthToken))
+		var edvHeader func(*http.Request) (*http.Header, error)
 
-					return &req.Header, nil
-				},
-			))
-		} else if rqst.EDVUnlock.Capability != "" && conf.EdvAuthSigner != nil {
-			edvOpts = append(edvOpts, edv.WithHeaders(
-				func(req *http.Request) (*http.Header, error) {
-					return conf.EdvAuthSigner.SignHeader(req, []byte(rqst.EDVUnlock.Capability))
-				},
-			))
+		if rqst.EDVUnlock.Capability != "" { // zcap ld signing
+			if conf.EdvAuthzProvider == nil {
+				return nil, fmt.Errorf("authorization capability for EDV is not configured")
+			}
+
+			signer := conf.EdvAuthzProvider.GetHeaderSigner(rqst.EDVUnlock.AuthZKeyStoreURL,
+				rqst.EDVUnlock.AuthToken, rqst.EDVUnlock.SecretShare)
+
+			edvHeader = func(req *http.Request) (*http.Header, error) {
+				return signer.SignHeader(req, []byte(rqst.EDVUnlock.Capability))
+			}
+		} else if rqst.EDVUnlock.AuthToken != "" { // auth token
+			edvHeader = func(req *http.Request) (*http.Header, error) {
+				req.Header.Set("authorization", fmt.Sprintf("Bearer %s", rqst.EDVUnlock.AuthToken))
+
+				return &req.Header, nil
+			}
 		}
+
+		edvOpts = append(edvOpts, edv.WithHeaders(edvHeader))
 	}
 
 	if conf.EDVBatchEndpointExtensionEnabled {
@@ -714,9 +934,15 @@ func prepareUnlockOptions(rqst *UnlockWalletRequest, conf *Config) []wallet.Unlo
 		edvOpts = append(edvOpts, edv.WithFullDocumentsReturnedFromQueries())
 	}
 
-	options = append(options, wallet.WithUnlockWebKMSOptions(webkmsOpts...), wallet.WithUnlockEDVOptions(edvOpts...))
+	tokenExpiry := conf.DefaultTokenExpiry
+	if rqst.Expiry > 0 {
+		tokenExpiry = rqst.Expiry
+	}
 
-	return options
+	options = append(options, wallet.WithUnlockWebKMSOptions(webkmsOpts...), wallet.WithUnlockEDVOptions(edvOpts...),
+		wallet.WithUnlockExpiry(tokenExpiry))
+
+	return options, nil
 }
 
 func prepareProveOptions(rqst *ProveRequest) []wallet.ProveOptions {
